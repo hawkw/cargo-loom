@@ -5,7 +5,6 @@ use std::{
     sync::atomic::{AtomicU8, Ordering},
 };
 
-pub const CARGO_LOG_WIDTH: usize = 12;
 pub use owo_colors::{style, OwoColorize, Style};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -64,13 +63,13 @@ impl ColorMode {
         }
     }
 
-    pub fn should_color_stdout(self) -> bool {
-        match self {
-            ColorMode::Auto => atty::is(atty::Stream::Stdout),
-            ColorMode::Always => true,
-            ColorMode::Never => false,
-        }
-    }
+    // pub fn should_color_stdout(self) -> bool {
+    //     match self {
+    //         ColorMode::Auto => atty::is(atty::Stream::Stdout),
+    //         ColorMode::Always => true,
+    //         ColorMode::Never => false,
+    //     }
+    // }
 
     pub fn should_color_stderr(self) -> bool {
         match self {

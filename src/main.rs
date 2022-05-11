@@ -1,9 +1,9 @@
 use cargo_loom::App;
-use color_eyre::{
-    eyre::{eyre, WrapErr},
-    Help,
-};
-fn main() -> color_eyre::Result<()> {
+use color_eyre::{eyre::WrapErr, Help};
+use std::process::Output;
+
+#[tokio::main]
+async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
 
     let app = App::parse()?;
@@ -13,9 +13,16 @@ fn main() -> color_eyre::Result<()> {
             .failing_tests(pkg)
             .context("collecting failing tests")
             .with_note(|| format!("package: {}", pkg.name))?;
-        app.checkpoint_failed(&failing)
-            .context("checkpointing failing tests")
+        let mut tasks = app
+            .run_failed(failing)
+            .context("running failed tests failing tests")
             .with_note(|| format!("package: {}", pkg.name))?;
+        while let Some(result) = tasks.join_one().await? {
+            let (name, Output { stdout, .. }) = result?;
+            let stdout =
+                std::str::from_utf8(&stdout[..]).with_context(|| format!("stdout from {name}"))?;
+            println!("\n --- test {name} ---\n\n{stdout}");
+        }
     }
 
     Ok(())

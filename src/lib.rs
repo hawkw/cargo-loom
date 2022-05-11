@@ -9,9 +9,11 @@ use owo_colors::{colors, OwoColorize};
 use std::{
     collections::HashMap,
     fmt,
-    process::{Command, Stdio},
+    process::{Command, Output, Stdio},
+    sync::Arc,
     time::{Instant, SystemTime},
 };
+use tokio::task::JoinSet;
 
 mod term;
 mod trace;
@@ -29,6 +31,7 @@ pub struct App {
     max_duration: Option<String>,
     max_threads: String,
     checkpoint_interval: String,
+    loom_log: Arc<str>,
 }
 
 #[derive(Default)]
@@ -139,6 +142,7 @@ const ENV_MAX_PERMUTATIONS: &str = "LOOM_MAX_PERMUTATIONS";
 const ENV_MAX_THREADS: &str = "LOOM_MAX_THREADS";
 const ENV_LOOM_LOG: &str = "LOOM_LOG";
 const ENV_CHECKPOINT_FILE: &str = "LOOM_CHECKPOINT_FILE";
+const ENV_LOOM_LOCATION: &str = "LOOM_LOCATION";
 
 impl Args {
     fn metadata(&self) -> color_eyre::Result<cargo_metadata::Metadata> {
@@ -200,7 +204,7 @@ impl App {
         let max_branches = args.max_branches.to_string();
         let max_threads = args.max_threads.to_string();
         let checkpoint_interval = args.checkpoint_interval.to_string();
-
+        let loom_log = Arc::from(args.loom_log.clone());
         Ok(Self {
             args,
             metadata,
@@ -213,6 +217,7 @@ impl App {
             max_permutations,
             max_threads,
             checkpoint_interval,
+            loom_log,
         })
     }
 
@@ -256,9 +261,7 @@ impl App {
         cmd
     }
 
-    fn configure_loom_command(&self, test: &CargoTest) -> Command {
-        let mut cmd = test.command();
-
+    fn configure_loom_command<'cmd>(&self, cmd: &'cmd mut Command) -> &'cmd mut Command {
         cmd.env(ENV_MAX_BRANCHES, &self.max_branches);
 
         if let Some(max_permutations) = self.max_permutations.as_deref() {
@@ -282,9 +285,9 @@ impl App {
                 tracing::info!(path = %test.path().display(), "Running {}", test.name())
             }
 
-            let mut cmd = self.configure_loom_command(&test);
-
-            cmd.env(ENV_LOOM_LOG, "off");
+            let mut cmd = test.command();
+            self.configure_loom_command(&mut cmd)
+                .env(ENV_LOOM_LOG, "off");
 
             if let Some(max_duration) = self.max_duration.as_deref() {
                 cmd.env(ENV_MAX_DURATION, max_duration);
@@ -351,38 +354,49 @@ impl App {
         Ok(failed)
     }
 
-    pub fn checkpoint_failed(&self, failed: &mut Failed) -> color_eyre::Result<()> {
-        for (suite, tests) in &failed.failed {
+    pub fn run_failed(
+        &self,
+        failed: Failed,
+    ) -> color_eyre::Result<JoinSet<color_eyre::Result<(String, Output)>>> {
+        let mut tasks = JoinSet::new();
+        for (suite, tests) in failed.failed {
             let suite = failed
                 .test_cmds
-                .get(suite)
+                .get(&suite)
                 .ok_or_else(|| eyre!("missing test command for suite `{}`", suite))?;
-            for FailedTest {
-                ref name,
-                ref checkpoint,
-            } in tests
-            {
-                let t0 = Instant::now();
-                let mut cmd = self.configure_loom_command(suite);
-                cmd.env(ENV_CHECKPOINT_INTERVAL, &self.checkpoint_interval)
-                    .env(ENV_CHECKPOINT_FILE, checkpoint)
+            for FailedTest { name, checkpoint } in tests {
+                let mut cmd = Command::new(suite.path());
+                self.configure_loom_command(&mut cmd)
+                    .env(ENV_CHECKPOINT_INTERVAL, &self.checkpoint_interval)
+                    .env(ENV_CHECKPOINT_FILE, &checkpoint)
                     .arg(&name);
+                let loom_log = self.loom_log.clone();
+                let pretty_name = format!("{suite}::{name}", suite = suite.name());
+                let task = async move {
+                    let t0 = Instant::now();
+                    tracing::info!(test = %pretty_name, "Generating checkpoint");
+                    tracing::trace!(?cmd);
+                    let mut cmd = tokio::process::Command::from(cmd);
+                    let _ = cmd
+                        .status()
+                        .await
+                        .with_context(|| format!("spawn process to checkpoint {pretty_name}"));
+                    let elapsed = t0.elapsed();
+                    tracing::debug!(test = %pretty_name, ?elapsed, file = %checkpoint, "checkpointed");
 
-                tracing::info!(test = %format_args!("{suite}::{name}", suite = suite.name()), "Generating checkpoint");
-                tracing::trace!(?cmd);
-
-                cmd.stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .spawn()
-                    .and_then(|mut child| child.wait())
-                    .with_context(|| {
-                        format!("checkpointing {suite}::{name}", suite = suite.name())
-                    })?;
-                let elapsed = t0.elapsed();
-                tracing::debug!(suite = %suite.name(), test = %name, ?elapsed, file = %checkpoint, "checkpointed");
+                    // now, run it again with logging
+                    let output = cmd
+                        .env(ENV_LOOM_LOG, loom_log.as_ref())
+                        .env(ENV_LOOM_LOCATION, "1")
+                        .output()
+                        .await
+                        .with_context(|| format!("spawn process to rerun {pretty_name}"))?;
+                    Ok((pretty_name, output))
+                };
+                tasks.spawn(task);
             }
         }
-        Ok(())
+        Ok(tasks)
     }
 }
 
