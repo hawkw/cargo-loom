@@ -48,6 +48,17 @@ struct FailedTest {
 }
 
 /// A utility for running Loom tests
+///
+/// This utility will compile Loom tests, run them once to collect a list of
+/// those tests which fail, generate checkpoint files for all failing tests, and
+/// then finally rerun the failing tests from the generated checkpoint with
+/// logging and location capture enabled.
+///
+/// By initially running the suite without without logging, location
+/// capture, or checkpointing enabled, `cargo-loom` can quickly identify those
+/// tests that fail, run them until a failing iteration is found, and then
+/// re-run only the failing iterations with diagnostics enabled. This makes
+/// running a large Loom suite much more efficient.
 #[derive(Parser, Debug)]
 #[clap(author, version, about)]
 struct Args {
