@@ -147,9 +147,9 @@ impl App {
     fn failing_tests(
         &self,
         pkg: &cargo_metadata::Package,
-    ) -> color_eyre::Result<HashMap<CargoTest, Vec<String>>> {
+    ) -> color_eyre::Result<HashMap<String, Vec<String>>> {
         let tests = self.test_cmd(pkg).run_tests()?;
-        let mut failed = HashMap::<String, Vec<String>>::new();
+        let mut failed: HashMap<String, Vec<String>> = HashMap::new();
 
         for test in tests {
             let test = test?;
@@ -186,10 +186,7 @@ impl App {
                 match msg.decode_custom::<Event>() {
                     Ok(Event::Test(Test::Failed(TestFailed { name, .. }))) => {
                         test_status::<colors::Red>(&name, "failed");
-                        failed
-                            .entry(test.name().to_string())
-                            .or_default()
-                            .push(name);
+                        failed.entry(test.name().to_owned()).or_default().push(name);
                     }
                     Ok(Event::Test(Test::Ok(TestOk { name, .. }))) => {
                         test_status::<colors::Green>(&name, "ok")
@@ -251,7 +248,16 @@ fn main() -> color_eyre::Result<()> {
         let failing = app
             .failing_tests(pkg)
             .with_note(|| format!("package: {}", pkg.name))?;
-        println!("pkg = {:?}; failing = {:?}", pkg.name, failing);
+
+        println!("package: {}", pkg.name);
+        if failing.is_empty() {
+            println!("\tno tests failed");
+            continue;
+        }
+
+        for (test, failed) in failing {
+            println!("\t{}: {:?}", test, failed);
+        }
     }
 
     Ok(())
