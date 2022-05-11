@@ -9,17 +9,27 @@ use std::{collections::HashMap, fmt, time::SystemTime};
 #[derive(Parser, Debug)]
 #[clap(author, version, about)]
 struct Args {
-    /// The path to the current cargo manifest.
-    #[clap(long, env = "CARGO_MANIFEST_PATH")]
+    /// Path to Cargo.toml
+    #[clap(long, env = "CARGO_MANIFEST_PATH", value_hint = clap::ValueHint::FilePath)]
     manifest_path: Option<std::path::PathBuf>,
+
     #[clap(flatten)]
     workspace: clap_cargo::Workspace,
+
     #[clap(flatten)]
     features: clap_cargo::Features,
 
+    /// Maximum number of permutations to explore
+    ///
+    /// This sets the value of the `LOOM_MAX_PERMUTATIONS` environment variable
+    /// for the test executable.
     #[clap(long, env = "LOOM_MAX_PREEMPTIONS", default_value_t = 2)]
     max_preemptions: usize,
 
+    /// How often to write the checkpoint file
+    ///
+    /// This sets the value of the `LOOM_CHECKPOINT_INTERVAL` environment
+    /// variable for the test executable.
     #[clap(long, env = "LOOM_CHECKPOINT_INTERVAL", default_value_t = 5)]
     checkpoint_interval: usize,
 
@@ -27,12 +37,15 @@ struct Args {
     #[clap(long)]
     lib: bool,
 
+    /// Test all tests
     #[clap(long)]
     tests: bool,
 
+    /// Test all examples
     #[clap(long)]
     examples: bool,
 
+    /// Test all binaries
     #[clap(long)]
     bins: bool,
 
