@@ -1,9 +1,16 @@
 use camino::Utf8PathBuf;
 use clap::Parser;
-use color_eyre::{eyre::WrapErr, Help};
+use color_eyre::{
+    eyre::{eyre, WrapErr},
+    Help,
+};
 use escargot::{format::test, CargoTest, CommandMessages};
 use owo_colors::{colors, OwoColorize};
-use std::{collections::HashMap, process::Command, time::SystemTime};
+use std::{
+    collections::HashMap,
+    process::{Command, Stdio},
+    time::{Instant, SystemTime},
+};
 
 /// A utility for running Loom tests
 #[derive(Parser, Debug)]
@@ -90,7 +97,7 @@ const ENV_MAX_DURATION: &str = "LOOM_MAX_DURATION";
 const ENV_MAX_PERMUTATIONS: &str = "LOOM_MAX_PERMUTATIONS";
 const ENV_MAX_THREADS: &str = "LOOM_MAX_THREADS";
 const ENV_LOOM_LOG: &str = "LOOM_LOG";
-
+const ENV_CHECKPOINT_FILE: &str = "LOOM_CHECKPOINT_FILE";
 #[derive(Debug)]
 struct App {
     args: Args,
@@ -105,6 +112,12 @@ struct App {
     max_duration: Option<String>,
     max_threads: String,
     checkpoint_interval: String,
+}
+
+#[derive(Default)]
+struct Failed {
+    failed: HashMap<String, Vec<String>>,
+    test_cmds: HashMap<String, CargoTest>,
 }
 
 impl Args {
@@ -207,7 +220,7 @@ impl App {
             cmd = cmd.no_default_features();
         }
 
-        if !dbg!(&self.args.features.features).is_empty() {
+        if !&self.args.features.features.is_empty() {
             cmd = cmd.features(&self.features)
         }
 
@@ -231,27 +244,18 @@ impl App {
         cmd
     }
 
-    fn failing_tests(
-        &self,
-        pkg: &cargo_metadata::Package,
-    ) -> color_eyre::Result<HashMap<String, Vec<String>>> {
+    fn failing_tests(&self, pkg: &cargo_metadata::Package) -> color_eyre::Result<Failed> {
         let tests = self.test_cmd(pkg).run_tests()?;
-        let mut failed: HashMap<String, Vec<String>> = HashMap::new();
+        let mut failed = Failed::default();
 
         for test in tests {
-            let test = test?;
+            let mut any_failed = false;
+            let test = test.context("getting next test failed")?;
             if test.kind() == "lib" {
                 eprintln!("\n Running unittests ({})\n", test.path().display())
             } else {
                 eprintln!("\n Running {} ({})\n", test.name(), test.path().display())
             }
-
-            // let checkpt_file = self.checkpoint_dir.as_path().join(format!(
-            //     "loom-{}-{}-{}.json",
-            //     pkg.name,
-            //     test.name(),
-            //     self.timestamp
-            // ));
 
             let mut cmd = self.configure_loom_command(&test);
 
@@ -270,11 +274,11 @@ impl App {
             let t0 = std::time::Instant::now();
             for msg in res {
                 use test::*;
-                let msg = msg.with_note(|| format!("running test `{}`", test.name()))?;
-                match msg.decode_custom::<Event>() {
+                match msg.and_then(|msg| msg.decode_custom::<Event>()) {
                     Ok(Event::Test(Test::Failed(TestFailed { name, .. }))) => {
                         test_status::<colors::Red>(&name, "failed");
-                        failed.entry(test.name().to_owned()).or_default().push(name);
+                        failed.fail_test(&test, name);
+                        any_failed = true;
                     }
                     Ok(Event::Test(Test::Ok(TestOk { name, .. }))) => {
                         test_status::<colors::Green>(&name, "ok")
@@ -305,12 +309,65 @@ impl App {
                     }))) => {
                         eprintln!("\ntest result: FAILED. {passed} passed; {failed} failed; {ignored} ignored; {measured} measured; {filtered_out} filtered out; finished in {:?}", t0.elapsed());
                     }
+                    Err(error) => eprintln!(
+                        "error from test (suite = {suite}): {error}",
+                        suite = test.name()
+                    ),
                     _ => {} // TODO(eliza: do something nice here...
                 }
+            }
+
+            if any_failed {
+                failed.test_cmds.insert(test.name().to_string(), test);
             }
         }
 
         Ok(failed)
+    }
+
+    fn checkpoint_failed(&self, failed: &Failed) -> color_eyre::Result<()> {
+        for (suite, tests) in &failed.failed {
+            let suite = failed
+                .test_cmds
+                .get(suite)
+                .ok_or_else(|| eyre!("missing test command for suite `{}`", suite))?;
+            for test in tests {
+                let t0 = Instant::now();
+                let file = self.checkpoint_file(suite, test.as_str());
+                let mut cmd = self.configure_loom_command(suite);
+                cmd.env(ENV_CHECKPOINT_INTERVAL, &self.checkpoint_interval)
+                    .env(ENV_CHECKPOINT_FILE, &file)
+                    .arg(test);
+                println!("checkpoint command: {cmd:?}");
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .spawn()
+                    .and_then(|mut child| child.wait())
+                    .with_context(|| format!("checkpointing {}::{}", suite.name(), &test))?;
+                let elapsed = t0.elapsed();
+                println!(
+                    "checkpointed {suite}::{test} in {elapsed:?} ({file}) ",
+                    suite = suite.name()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn checkpoint_file(&self, suite: &CargoTest, test_name: &str) -> Utf8PathBuf {
+        self.checkpoint_dir
+            .join(format!("{suite}-{test_name}.json", suite = suite.name()))
+    }
+}
+
+impl Failed {
+    // fn collect_suite(&mut self, command: Command)
+
+    fn fail_test(&mut self, suite: &CargoTest, test_name: String) {
+        self.failed
+            .entry(suite.name().to_owned())
+            .or_default()
+            .push(test_name);
     }
 }
 
@@ -335,17 +392,11 @@ fn main() -> color_eyre::Result<()> {
     for pkg in wanted_pkgs {
         let failing = app
             .failing_tests(pkg)
+            .context("collecting failing tests")
             .with_note(|| format!("package: {}", pkg.name))?;
-
-        println!("package: {}", pkg.name);
-        if failing.is_empty() {
-            println!("\tno tests failed");
-            continue;
-        }
-
-        for (test, failed) in failing {
-            println!("\t{}: {:?}", test, failed);
-        }
+        app.checkpoint_failed(&failing)
+            .context("checkpointing failing tests")
+            .with_note(|| format!("package: {}", pkg.name))?;
     }
 
     Ok(())
