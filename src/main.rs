@@ -1,9 +1,9 @@
 use camino::Utf8PathBuf;
-use clap::{Command, Parser};
+use clap::Parser;
 use color_eyre::{eyre::WrapErr, Help};
 use escargot::{format::test, CargoTest, CommandMessages};
 use owo_colors::{colors, OwoColorize};
-use std::{collections::HashMap, fmt, time::SystemTime};
+use std::{collections::HashMap, process::Command, time::SystemTime};
 
 /// A utility for running Loom tests
 #[derive(Parser, Debug)]
@@ -19,19 +19,53 @@ struct Args {
     #[clap(flatten)]
     features: clap_cargo::Features,
 
+    /// Maximum number of thread switches per permutation.
+    ///
+    /// If no value is provided, the number of thread switches per permutation
+    /// will not be bounded.
+    ///
+    /// This sets the value of the `LOOM_MAX_BRANCHES` environment variable for
+    /// the test executable.
+    #[clap(long, env = ENV_MAX_BRANCHES)]
+    max_branches: Option<usize>,
+
     /// Maximum number of permutations to explore
+    ///
+    /// If no value is provided, the number of permutations will not be bounded.
     ///
     /// This sets the value of the `LOOM_MAX_PERMUTATIONS` environment variable
     /// for the test executable.
-    #[clap(long, env = "LOOM_MAX_PREEMPTIONS", default_value_t = 2)]
-    max_preemptions: usize,
+    #[clap(long, env = ENV_MAX_PERMUTATIONS)]
+    max_permutations: Option<usize>,
+
+    /// Max number of threads to check as part of the execution.
+    ///
+    /// This should be set as low as possible and must be less than 4.
+    ///
+    /// This sets the value of the `LOOM_MAX_THREADS` environment variable for
+    /// the test execution.
+    #[clap(long, env = ENV_MAX_THREADS, default_value_t = 4)]
+    max_threads: usize,
 
     /// How often to write the checkpoint file
     ///
     /// This sets the value of the `LOOM_CHECKPOINT_INTERVAL` environment
     /// variable for the test executable.
-    #[clap(long, env = "LOOM_CHECKPOINT_INTERVAL", default_value_t = 5)]
+    #[clap(long, env = ENV_CHECKPOINT_INTERVAL, default_value_t = 5)]
     checkpoint_interval: usize,
+
+    /// Maximum duration to run each loom model for, in seconds
+    ///
+    /// If a value is not provided, no duration limit will be set.
+    ///
+    /// This sets the value of the `LOOM_MAX_DURATION` environment variable for
+    /// the test executable.
+    #[clap(long, env = ENV_MAX_DURATION)]
+    max_duration_secs: Option<usize>,
+
+    /// Log level filter for `loom` when re-running failed tests
+    #[clap(long, env = ENV_LOOM_LOG, default_value = "trace")]
+    loom_log: String,
 
     /// Test only this package's library unit tests
     #[clap(long)]
@@ -48,11 +82,17 @@ struct Args {
     /// Test all binaries
     #[clap(long)]
     bins: bool,
-
-    /// Run loom tests in release mode.
-    #[clap(long)]
-    release: bool,
+    // /// Run loom tests in release mode.
+    // #[clap(long)]
+    // release: bool,
 }
+
+const ENV_CHECKPOINT_INTERVAL: &str = "LOOM_CHECKPOINT_INTERVAL";
+const ENV_MAX_BRANCHES: &str = "LOOM_MAX_BRANCHES";
+const ENV_MAX_DURATION: &str = "LOOM_MAX_DURATION";
+const ENV_MAX_PERMUTATIONS: &str = "LOOM_MAX_PERMUTATIONS";
+const ENV_MAX_THREADS: &str = "LOOM_MAX_THREADS";
+const ENV_LOOM_LOG: &str = "LOOM_LOG";
 
 #[derive(Debug)]
 struct App {
@@ -63,6 +103,11 @@ struct App {
     target_dir: Utf8PathBuf,
     features: String,
     rustflags: String,
+    max_branches: Option<String>,
+    max_permutations: Option<String>,
+    max_duration: Option<String>,
+    max_threads: String,
+    checkpoint_interval: String,
 }
 
 impl Args {
@@ -85,13 +130,17 @@ impl App {
             target_dir.push("loom");
             target_dir
         };
-        let checkpoint_dir = target_dir.as_path().join("checkpoint");
-        std::fs::create_dir_all(checkpoint_dir.as_os_str())
-            .with_context(|| format!("creating checkpoint directory `{}`", checkpoint_dir))?;
         let timestamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("SystemTime should never be before UNIX_EPOCH")
             .as_secs();
+        let checkpoint_dir = target_dir
+            .as_path()
+            .join("checkpoint")
+            .join(format!("run_{}", timestamp));
+        std::fs::create_dir_all(checkpoint_dir.as_os_str())
+            .with_context(|| format!("creating checkpoint directory `{}`", checkpoint_dir))?;
+
         let mut features = String::new();
         let mut feature_list = args.features.features.iter();
         if let Some(feature) = feature_list.next() {
@@ -106,6 +155,16 @@ impl App {
             rustflags.push(' ');
         }
         rustflags.push_str("--cfg loom --cfg debug_assertions");
+
+        // These all need to be represented as strings to pass them as env
+        // variables. Format them a single time so we don't have to do it every
+        // time we run a test.
+        let max_duration = args.max_duration_secs.as_ref().map(ToString::to_string);
+        let max_permutations = args.max_permutations.as_ref().map(ToString::to_string);
+        let max_branches = args.max_branches.as_ref().map(ToString::to_string);
+        let max_threads = args.max_threads.to_string();
+        let checkpoint_interval = args.checkpoint_interval.to_string();
+
         Ok(Self {
             args,
             metadata,
@@ -114,6 +173,11 @@ impl App {
             timestamp,
             features,
             rustflags,
+            max_branches,
+            max_duration,
+            max_permutations,
+            max_threads,
+            checkpoint_interval,
         })
     }
 
@@ -157,6 +221,21 @@ impl App {
         cmd
     }
 
+    fn configure_loom_command(&self, test: &CargoTest) -> Command {
+        let mut cmd = test.command();
+
+        if let Some(max_branches) = self.max_branches.as_deref() {
+            cmd.env(ENV_MAX_BRANCHES, max_branches);
+        }
+
+        if let Some(max_permutations) = self.max_permutations.as_deref() {
+            cmd.env(ENV_MAX_PERMUTATIONS, max_permutations);
+        }
+
+        cmd.env(ENV_MAX_THREADS, &self.max_threads);
+        cmd
+    }
+
     fn failing_tests(
         &self,
         pkg: &cargo_metadata::Package,
@@ -172,23 +251,24 @@ impl App {
                 eprintln!("\n Running {} ({})\n", test.name(), test.path().display())
             }
 
-            let checkpt_file = self.checkpoint_dir.as_path().join(format!(
-                "loom-{}-{}-{}.json",
-                pkg.name,
-                test.name(),
-                self.timestamp
-            ));
-            let mut cmd = test.command();
-            cmd.env(
-                "LOOM_MAX_PREEMPTIONS",
-                format!("{}", self.args.max_preemptions),
-            )
-            .env("LOOM_CHECKPOINT_FILE", checkpt_file)
-            .env(
-                "LOOM_CHECKPOINT_INTERVAL",
-                format!("{}", self.args.checkpoint_interval),
-            )
-            .env("LOOM_LOG", "off");
+            // let checkpt_file = self.checkpoint_dir.as_path().join(format!(
+            //     "loom-{}-{}-{}.json",
+            //     pkg.name,
+            //     test.name(),
+            //     self.timestamp
+            // ));
+
+            let mut cmd = self.configure_loom_command(&test);
+
+            cmd.env(ENV_LOOM_LOG, "off");
+
+            if let Some(max_duration) = self.max_duration.as_deref() {
+                cmd.env(ENV_MAX_DURATION, max_duration);
+            }
+            // Don't enable checkpoints, logging, or location tracking for this
+            // run. Our goal here is *only* to get the names of the failing
+            // tests so we can re-run them individually with their own
+            // checkpoint files.
 
             let res = CommandMessages::with_command(cmd)
                 .with_note(|| format!("running test suite `{}`", test.name()))?;
