@@ -9,7 +9,7 @@ use owo_colors::{colors, OwoColorize};
 use std::{
     collections::HashMap,
     fmt,
-    process::{Command, Output, Stdio},
+    process::{Command, Output},
     sync::Arc,
     time::{Instant, SystemTime},
 };
@@ -21,7 +21,7 @@ mod trace;
 #[derive(Debug)]
 pub struct App {
     args: Args,
-    checkpoint_dir: Utf8PathBuf,
+    pub checkpoint_dir: Utf8PathBuf,
     metadata: cargo_metadata::Metadata,
     target_dir: Utf8PathBuf,
     features: String,

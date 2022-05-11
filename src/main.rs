@@ -25,5 +25,7 @@ async fn main() -> color_eyre::Result<()> {
         }
     }
 
+    tracing::info!(checkpoint_dir = %app.checkpoint_dir, "Completed loom run");
+
     Ok(())
 }
