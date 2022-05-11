@@ -21,13 +21,10 @@ struct Args {
 
     /// Maximum number of thread switches per permutation.
     ///
-    /// If no value is provided, the number of thread switches per permutation
-    /// will not be bounded.
-    ///
     /// This sets the value of the `LOOM_MAX_BRANCHES` environment variable for
     /// the test executable.
-    #[clap(long, env = ENV_MAX_BRANCHES)]
-    max_branches: Option<usize>,
+    #[clap(long, env = ENV_MAX_BRANCHES, default_value_t = 1_000)]
+    max_branches: usize,
 
     /// Maximum number of permutations to explore
     ///
@@ -103,7 +100,7 @@ struct App {
     target_dir: Utf8PathBuf,
     features: String,
     rustflags: String,
-    max_branches: Option<String>,
+    max_branches: String,
     max_permutations: Option<String>,
     max_duration: Option<String>,
     max_threads: String,
@@ -161,7 +158,7 @@ impl App {
         // time we run a test.
         let max_duration = args.max_duration_secs.as_ref().map(ToString::to_string);
         let max_permutations = args.max_permutations.as_ref().map(ToString::to_string);
-        let max_branches = args.max_branches.as_ref().map(ToString::to_string);
+        let max_branches = args.max_branches.to_string();
         let max_threads = args.max_threads.to_string();
         let checkpoint_interval = args.checkpoint_interval.to_string();
 
@@ -224,9 +221,7 @@ impl App {
     fn configure_loom_command(&self, test: &CargoTest) -> Command {
         let mut cmd = test.command();
 
-        if let Some(max_branches) = self.max_branches.as_deref() {
-            cmd.env(ENV_MAX_BRANCHES, max_branches);
-        }
+        cmd.env(ENV_MAX_BRANCHES, &self.max_branches);
 
         if let Some(max_permutations) = self.max_permutations.as_deref() {
             cmd.env(ENV_MAX_PERMUTATIONS, max_permutations);
