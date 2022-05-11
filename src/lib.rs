@@ -1,4 +1,4 @@
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use clap::Parser;
 use color_eyre::{
     eyre::{eyre, WrapErr},
@@ -8,9 +8,13 @@ use escargot::{format::test, CargoTest, CommandMessages};
 use owo_colors::{colors, OwoColorize};
 use std::{
     collections::HashMap,
+    fmt,
     process::{Command, Stdio},
     time::{Instant, SystemTime},
 };
+
+mod term;
+mod trace;
 
 #[derive(Debug)]
 pub struct App {
@@ -29,8 +33,15 @@ pub struct App {
 
 #[derive(Default)]
 pub struct Failed {
-    failed: HashMap<String, Vec<String>>,
+    failed: HashMap<String, Vec<FailedTest>>,
     test_cmds: HashMap<String, CargoTest>,
+}
+
+#[derive(Debug)]
+
+struct FailedTest {
+    name: String,
+    checkpoint: Utf8PathBuf,
 }
 
 /// A utility for running Loom tests
@@ -107,9 +118,18 @@ struct Args {
     /// Test all binaries
     #[clap(long)]
     bins: bool,
-    // /// Run loom tests in release mode.
-    // #[clap(long)]
-    // release: bool,
+
+    /// Whether to emit colors in output.
+    #[clap(
+        long,
+        possible_values(&["auto", "always", "never"]),
+        env = "CARGO_TERM_COLORS",
+        default_value = "auto"
+    )]
+    color: term::ColorMode,
+
+    #[clap(long, default_value = "cargo_loom=info,warn")]
+    log: tracing_subscriber::EnvFilter,
 }
 
 const ENV_CHECKPOINT_INTERVAL: &str = "LOOM_CHECKPOINT_INTERVAL";
@@ -136,7 +156,9 @@ impl App {
         Self::from_args(Args::parse())
     }
 
-    fn from_args(args: Args) -> color_eyre::Result<Self> {
+    fn from_args(mut args: Args) -> color_eyre::Result<Self> {
+        args.color.set_global();
+        trace::try_init(std::mem::take(&mut args.log), args.color).context("initialize tracing")?;
         let metadata = args.metadata()?;
         let target_dir = {
             let mut target_dir = metadata.workspace_root.clone();
@@ -255,9 +277,9 @@ impl App {
             let mut any_failed = false;
             let test = test.context("getting next test failed")?;
             if test.kind() == "lib" {
-                eprintln!("\n Running unittests ({})\n", test.path().display())
+                tracing::info!(path = %test.path().display(), "Running unittests")
             } else {
-                eprintln!("\n Running {} ({})\n", test.name(), test.path().display())
+                tracing::info!(path = %test.path().display(), "Running {}", test.name())
             }
 
             let mut cmd = self.configure_loom_command(&test);
@@ -280,7 +302,7 @@ impl App {
                 match msg.and_then(|msg| msg.decode_custom::<Event>()) {
                     Ok(Event::Test(Test::Failed(TestFailed { name, .. }))) => {
                         test_status::<colors::Red>(&name, "failed");
-                        failed.fail_test(&test, name);
+                        failed.fail_test(&test, name, &self.checkpoint_dir);
                         any_failed = true;
                     }
                     Ok(Event::Test(Test::Ok(TestOk { name, .. }))) => {
@@ -290,7 +312,7 @@ impl App {
                         test_status::<colors::Yellow>(&name, "ignored")
                     }
                     Ok(Event::Suite(Suite::Started(SuiteStarted { test_count, .. }))) => {
-                        eprintln!("running {} tests", test_count);
+                        eprintln!("\nrunning {} tests", test_count);
                     }
                     Ok(Event::Suite(Suite::Ok(SuiteOk {
                         passed,
@@ -312,9 +334,10 @@ impl App {
                     }))) => {
                         eprintln!("\ntest result: FAILED. {passed} passed; {failed} failed; {ignored} ignored; {measured} measured; {filtered_out} filtered out; finished in {:?}", t0.elapsed());
                     }
-                    Err(error) => eprintln!(
-                        "error from test (suite = {suite}): {error}",
-                        suite = test.name()
+                    Err(error) => tracing::warn!(
+                        suite = %test.name(),
+                        %error,
+                        "error from test",
                     ),
                     _ => {} // TODO(eliza: do something nice here...
                 }
@@ -328,49 +351,69 @@ impl App {
         Ok(failed)
     }
 
-    pub fn checkpoint_failed(&self, failed: &Failed) -> color_eyre::Result<()> {
+    pub fn checkpoint_failed(&self, failed: &mut Failed) -> color_eyre::Result<()> {
         for (suite, tests) in &failed.failed {
             let suite = failed
                 .test_cmds
                 .get(suite)
                 .ok_or_else(|| eyre!("missing test command for suite `{}`", suite))?;
-            for test in tests {
+            for FailedTest {
+                ref name,
+                ref checkpoint,
+            } in tests
+            {
                 let t0 = Instant::now();
-                let file = self.checkpoint_file(suite, test.as_str());
                 let mut cmd = self.configure_loom_command(suite);
                 cmd.env(ENV_CHECKPOINT_INTERVAL, &self.checkpoint_interval)
-                    .env(ENV_CHECKPOINT_FILE, &file)
-                    .arg(test);
-                println!("checkpoint command: {cmd:?}");
+                    .env(ENV_CHECKPOINT_FILE, checkpoint)
+                    .arg(&name);
+
+                tracing::info!(test = %format_args!("{suite}::{name}", suite = suite.name()), "Generating checkpoint");
+                tracing::trace!(?cmd);
+
                 cmd.stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .spawn()
                     .and_then(|mut child| child.wait())
-                    .with_context(|| format!("checkpointing {}::{}", suite.name(), &test))?;
+                    .with_context(|| {
+                        format!("checkpointing {suite}::{name}", suite = suite.name())
+                    })?;
                 let elapsed = t0.elapsed();
-                println!(
-                    "checkpointed {suite}::{test} in {elapsed:?} ({file}) ",
-                    suite = suite.name()
-                );
+                tracing::debug!(suite = %suite.name(), test = %name, ?elapsed, file = %checkpoint, "checkpointed");
             }
         }
         Ok(())
     }
+}
 
-    fn checkpoint_file(&self, suite: &CargoTest, test_name: &str) -> Utf8PathBuf {
-        self.checkpoint_dir
-            .join(format!("{suite}-{test_name}.json", suite = suite.name()))
+impl FailedTest {
+    fn new(name: String, suite: &CargoTest, checkpoint_dir: impl AsRef<Utf8Path>) -> Self {
+        let checkpoint = checkpoint_dir
+            .as_ref()
+            .join(format!("{suite}-{name}.json", suite = suite.name()));
+        Self { name, checkpoint }
+    }
+}
+
+impl fmt::Display for FailedTest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.name.fmt(f)
     }
 }
 
 impl Failed {
     // fn collect_suite(&mut self, command: Command)
 
-    fn fail_test(&mut self, suite: &CargoTest, test_name: String) {
+    fn fail_test(
+        &mut self,
+        suite: &CargoTest,
+        test_name: String,
+        checkpoint_dir: impl AsRef<Utf8Path>,
+    ) {
         self.failed
             .entry(suite.name().to_owned())
             .or_default()
-            .push(test_name);
+            .push(FailedTest::new(test_name, suite, checkpoint_dir));
     }
 }
 
