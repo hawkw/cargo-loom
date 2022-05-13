@@ -144,6 +144,9 @@ struct Args {
 
     #[clap(long, default_value = "cargo_loom=info,warn")]
     log: tracing_subscriber::EnvFilter,
+
+    /// If specified, only run tests containing this string in their names
+    testname: Option<String>,
 }
 
 const ENV_CHECKPOINT_INTERVAL: &str = "LOOM_CHECKPOINT_INTERVAL";
@@ -297,16 +300,28 @@ impl App {
             }
 
             let mut cmd = test.command();
-            self.configure_loom_command(&mut cmd)
-                .env(ENV_LOOM_LOG, "off");
 
-            if let Some(max_duration) = self.max_duration.as_deref() {
-                cmd.env(ENV_MAX_DURATION, max_duration);
-            }
             // Don't enable checkpoints, logging, or location tracking for this
             // run. Our goal here is *only* to get the names of the failing
             // tests so we can re-run them individually with their own
             // checkpoint files.
+            self.configure_loom_command(&mut cmd)
+                .env(ENV_LOOM_LOG, "off");
+
+            // If a test name filter was provided, pass that to the test
+            // command.
+            //
+            // This isn't added by `configure_loom_command`, because we don't
+            // want to set duration limits when re-running with logging etc (as
+            // it may be slower).
+            if let Some(max_duration) = self.max_duration.as_deref() {
+                cmd.env(ENV_MAX_DURATION, max_duration);
+            }
+
+            // If a test name filter was provided, pass that to the test command.
+            if let Some(testname) = self.args.testname.as_deref() {
+                cmd.arg(testname);
+            }
 
             let res = CommandMessages::with_command(cmd)
                 .with_note(|| format!("running test suite `{}`", test.name()))?;
