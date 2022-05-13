@@ -31,6 +31,7 @@ pub struct App {
     max_threads: String,
     checkpoint_interval: String,
     loom_log: Arc<str>,
+    test_args: Arc<Vec<String>>,
 }
 
 #[derive(Default)]
@@ -137,6 +138,10 @@ struct Args {
 
     /// If specified, only run tests containing this string in their names
     testname: Option<String>,
+
+    /// Arguments passed to the test binary.
+    #[clap(raw = true)]
+    test_args: Vec<String>,
 }
 
 const ENV_CHECKPOINT_INTERVAL: &str = "LOOM_CHECKPOINT_INTERVAL";
@@ -210,6 +215,7 @@ impl App {
         let max_threads = args.max_threads.to_string();
         let checkpoint_interval = args.checkpoint_interval.to_string();
         let loom_log = Arc::from(args.loom_log.clone());
+        let test_args = Arc::from(args.test_args.clone());
         Ok(Self {
             args,
             metadata,
@@ -223,6 +229,7 @@ impl App {
             max_threads,
             checkpoint_interval,
             loom_log,
+            test_args,
         })
     }
 
@@ -274,6 +281,11 @@ impl App {
         }
 
         cmd.env(ENV_MAX_THREADS, &self.max_threads);
+
+        if !self.test_args.is_empty() {
+            cmd.args(&self.test_args[..]);
+        }
+
         cmd
     }
 
