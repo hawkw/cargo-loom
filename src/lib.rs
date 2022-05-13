@@ -10,7 +10,7 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::OsStr,
     fmt, fs,
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     sync::Arc,
     time::Instant,
 };
@@ -501,6 +501,8 @@ impl App {
                         tracing::info!(test = %pretty_name, "Generating checkpoint");
                         tracing::trace!(?cmd);
                         let _ = cmd
+                            .stderr(Stdio::null())
+                            .stdout(Stdio::null())
                             .status()
                             .await
                             .with_context(|| format!("spawn process to checkpoint {pretty_name}"));
