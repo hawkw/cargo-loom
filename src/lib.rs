@@ -8,7 +8,8 @@ use escargot::{format::test, CargoTest, CommandMessages};
 use owo_colors::{colors, OwoColorize};
 use std::{
     collections::{HashMap, HashSet},
-    fmt,
+    ffi::OsStr,
+    fmt, fs,
     process::{Command, Output},
     sync::Arc,
     time::Instant,
@@ -182,7 +183,7 @@ impl App {
             target_dir
         };
         let checkpoint_dir = target_dir.as_path().join("checkpoint");
-        std::fs::create_dir_all(checkpoint_dir.as_os_str())
+        fs::create_dir_all(checkpoint_dir.as_os_str())
             .with_context(|| format!("creating checkpoint directory `{}`", checkpoint_dir))?;
 
         let mut features = String::new();
@@ -288,11 +289,11 @@ impl App {
         let tests = self.test_cmd(pkg).run_tests()?;
         let mut failed = Failed::default();
 
-        for test in tests {
+        for suite in tests {
             let mut any_failed = false;
-            let test = test.context("getting next test failed")?;
+            let suite = suite.context("getting next test failed")?;
 
-            let bin_path = test
+            let bin_path = suite
                 .path()
                 .file_name()
                 .ok_or_else(|| eyre!("test binary must have a file name"))
@@ -301,20 +302,17 @@ impl App {
                         .to_str()
                         .ok_or_else(|| eyre!("binary path was not utf8"))
                 })
-                .with_note(|| format!("bin path: {}", test.path().display()))?;
+                .with_note(|| format!("bin path: {}", suite.path().display()))?;
 
             let checkpoint_dir = self.checkpoint_dir.as_path().join(bin_path);
-            std::fs::create_dir_all(checkpoint_dir.as_os_str()).with_context(|| {
-                format!("failed to create checkpoint directory `{}`", checkpoint_dir)
-            })?;
 
-            if test.kind() == "lib" {
-                tracing::info!(path = %test.path().display(), "Running unittests")
+            if suite.kind() == "lib" {
+                tracing::info!(path = %suite.path().display(), "Running unittests")
             } else {
-                tracing::info!(path = %test.path().display(), "Running {}", test.name())
+                tracing::info!(path = %suite.path().display(), "Running {}", suite.name())
             }
 
-            let mut cmd = test.command();
+            let mut cmd = suite.command();
 
             // Don't enable checkpoints, logging, or location tracking for this
             // run. Our goal here is *only* to get the names of the failing
@@ -338,8 +336,53 @@ impl App {
                 cmd.arg(testname);
             }
 
+            // If there is already a checkpoint dir for this artifact hash, skip
+            // any previously checkpointed tests.
+            if checkpoint_dir.exists() {
+                (|| {
+                    let mut has_printed = false;
+                    for entry in fs::read_dir(checkpoint_dir.as_std_path())? {
+                        let path = entry?.path();
+                        match path.extension() {
+                            Some(extension) if extension == "json" => {
+                                if let Some(test) = path.file_stem().and_then(OsStr::to_str) {
+                                    // does the test name filter care about
+                                    // this test?
+                                    let is_included = self
+                                        .args
+                                        .testname
+                                        .as_deref()
+                                        .map(|testname| test.contains(testname))
+                                        .unwrap_or(true);
+                                    if is_included {
+                                        cmd.arg("--skip").arg(test);
+                                        failed.fail_test(&suite, test.to_owned(), &checkpoint_dir);
+                                        any_failed = true;
+                                        if !has_printed {
+                                            eprintln!("\npreviously checkpointed");
+                                            has_printed = true;
+                                        }
+
+                                        test_status::<colors::Red>(test, "failed")
+                                    }
+                                }
+                            }
+                            _ => continue,
+                        }
+                    }
+                    Ok::<(), std::io::Error>(())
+                })()
+                .with_context(|| {
+                    format!("failed to read checkpoint directory `{}`", checkpoint_dir)
+                })?;
+            } else {
+                fs::create_dir_all(checkpoint_dir.as_os_str()).with_context(|| {
+                    format!("failed to create checkpoint directory `{}`", checkpoint_dir)
+                })?;
+            }
+
             let res = CommandMessages::with_command(cmd)
-                .with_note(|| format!("running test suite `{}`", test.name()))?;
+                .with_note(|| format!("running test suite `{}`", suite.name()))?;
             let t0 = std::time::Instant::now();
             for msg in res {
                 use test::*;
@@ -351,7 +394,7 @@ impl App {
                         } else {
                             test_status::<colors::Red>(&test_failed.name, "failed");
                         }
-                        failed.fail_test(&test, test_failed.name, &checkpoint_dir);
+                        failed.fail_test(&suite, test_failed.name, &checkpoint_dir);
                         any_failed = true;
                     }
                     Ok(Event::Test(Test::Ok(ok))) => {
@@ -411,7 +454,7 @@ impl App {
                         }
                     }
                     Err(error) => tracing::warn!(
-                        suite = %test.name(),
+                        suite = %suite.name(),
                         %error,
                         "error from test",
                     ),
@@ -424,7 +467,7 @@ impl App {
             }
 
             if any_failed {
-                failed.test_cmds.insert(test.name().to_string(), test);
+                failed.test_cmds.insert(suite.name().to_string(), suite);
             }
         }
 
@@ -451,15 +494,19 @@ impl App {
                 let pretty_name = format!("{suite}::{name}", suite = suite.name());
                 let task = async move {
                     let t0 = Instant::now();
-                    tracing::info!(test = %pretty_name, "Generating checkpoint");
-                    tracing::trace!(?cmd);
                     let mut cmd = tokio::process::Command::from(cmd);
-                    let _ = cmd
-                        .status()
-                        .await
-                        .with_context(|| format!("spawn process to checkpoint {pretty_name}"));
-                    let elapsed = t0.elapsed();
-                    tracing::debug!(test = %pretty_name, ?elapsed, file = %checkpoint, "checkpointed");
+                    if checkpoint.exists() {
+                        tracing::debug!(test = %pretty_name, "Already checkpointed", )
+                    } else {
+                        tracing::info!(test = %pretty_name, "Generating checkpoint");
+                        tracing::trace!(?cmd);
+                        let _ = cmd
+                            .status()
+                            .await
+                            .with_context(|| format!("spawn process to checkpoint {pretty_name}"));
+                        let elapsed = t0.elapsed();
+                        tracing::debug!(test = %pretty_name, ?elapsed, file = %checkpoint, "checkpointed");
+                    }
 
                     // now, run it again with logging
                     let output = cmd
