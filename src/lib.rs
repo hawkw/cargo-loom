@@ -7,11 +7,11 @@ use color_eyre::{
 use escargot::{format::test, CargoTest, CommandMessages};
 use owo_colors::{colors, OwoColorize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     process::{Command, Output},
     sync::Arc,
-    time::{Instant, SystemTime},
+    time::Instant,
 };
 use tokio::task::JoinSet;
 
@@ -38,6 +38,7 @@ pub struct App {
 pub struct Failed {
     failed: HashMap<String, Vec<FailedTest>>,
     test_cmds: HashMap<String, CargoTest>,
+    checkpoint_dirs: HashSet<Utf8PathBuf>,
 }
 
 #[derive(Debug)]
@@ -180,14 +181,7 @@ impl App {
             target_dir.push("loom");
             target_dir
         };
-        let timestamp = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("SystemTime should never be before UNIX_EPOCH")
-            .as_secs();
-        let checkpoint_dir = target_dir
-            .as_path()
-            .join("checkpoint")
-            .join(format!("run_{}", timestamp));
+        let checkpoint_dir = target_dir.as_path().join("checkpoint");
         std::fs::create_dir_all(checkpoint_dir.as_os_str())
             .with_context(|| format!("creating checkpoint directory `{}`", checkpoint_dir))?;
 
@@ -297,6 +291,23 @@ impl App {
         for test in tests {
             let mut any_failed = false;
             let test = test.context("getting next test failed")?;
+
+            let bin_path = test
+                .path()
+                .file_name()
+                .ok_or_else(|| eyre!("test binary must have a file name"))
+                .and_then(|os_str| {
+                    os_str
+                        .to_str()
+                        .ok_or_else(|| eyre!("binary path was not utf8"))
+                })
+                .with_note(|| format!("bin path: {}", test.path().display()))?;
+
+            let checkpoint_dir = self.checkpoint_dir.as_path().join(bin_path);
+            std::fs::create_dir_all(checkpoint_dir.as_os_str()).with_context(|| {
+                format!("failed to create checkpoint directory `{}`", checkpoint_dir)
+            })?;
+
             if test.kind() == "lib" {
                 tracing::info!(path = %test.path().display(), "Running unittests")
             } else {
@@ -340,7 +351,7 @@ impl App {
                         } else {
                             test_status::<colors::Red>(&test_failed.name, "failed");
                         }
-                        failed.fail_test(&test, test_failed.name, &self.checkpoint_dir);
+                        failed.fail_test(&test, test_failed.name, &checkpoint_dir);
                         any_failed = true;
                     }
                     Ok(Event::Test(Test::Ok(ok))) => {
@@ -467,10 +478,8 @@ impl App {
 }
 
 impl FailedTest {
-    fn new(name: String, suite: &CargoTest, checkpoint_dir: impl AsRef<Utf8Path>) -> Self {
-        let checkpoint = checkpoint_dir
-            .as_ref()
-            .join(format!("{suite}-{name}.json", suite = suite.name()));
+    fn new(name: String, checkpoint_dir: impl AsRef<Utf8Path>) -> Self {
+        let checkpoint = checkpoint_dir.as_ref().join(format!("{name}.json"));
         Self { name, checkpoint }
     }
 }
@@ -482,7 +491,9 @@ impl fmt::Display for FailedTest {
 }
 
 impl Failed {
-    // fn collect_suite(&mut self, command: Command)
+    pub fn take_checkpoint_dirs(&mut self) -> HashSet<Utf8PathBuf> {
+        std::mem::take(&mut self.checkpoint_dirs)
+    }
 
     fn fail_test(
         &mut self,
@@ -490,10 +501,14 @@ impl Failed {
         test_name: String,
         checkpoint_dir: impl AsRef<Utf8Path>,
     ) {
+        let checkpoint_dir = checkpoint_dir.as_ref();
+        if !self.checkpoint_dirs.contains(checkpoint_dir) {
+            self.checkpoint_dirs.insert(checkpoint_dir.to_path_buf());
+        }
         self.failed
             .entry(suite.name().to_owned())
             .or_default()
-            .push(FailedTest::new(test_name, suite, checkpoint_dir));
+            .push(FailedTest::new(test_name, checkpoint_dir));
     }
 }
 
