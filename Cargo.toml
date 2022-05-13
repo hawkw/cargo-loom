@@ -17,5 +17,6 @@ heck = "0.3.3"
 serde = "1"
 owo-colors = {version = "3.4.0", features = ["supports-colors"] }
 tracing = "0.1.23"
-tracing-subscriber = { version = "0.3.1", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.1", features = ["env-filter", "json"] }
 tokio = { version = "1.18", features = ["full"] }
+serde_json = "1"

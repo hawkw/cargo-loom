@@ -1,7 +1,11 @@
-use crate::term::{style, ColorMode, OwoColorize, Style};
+use std::{
+    fmt,
+    sync::atomic::{AtomicU8, Ordering},
+};
+
 use color_eyre::Result;
 use heck::TitleCase;
-use std::fmt;
+pub use owo_colors::{style, OwoColorize, Style};
 use tracing::{field::Field, Event, Level, Subscriber};
 use tracing_subscriber::{
     field::Visit,
@@ -9,19 +13,181 @@ use tracing_subscriber::{
     registry::LookupSpan,
 };
 
-pub(crate) fn try_init(filter: tracing_subscriber::EnvFilter, color_mode: ColorMode) -> Result<()> {
-    use tracing_subscriber::prelude::*;
-    let fmt = tracing_subscriber::fmt::layer()
-        .event_format(CargoFormatter {
-            styles: Styles::new(color_mode),
-        })
-        .with_writer(std::io::stderr);
+#[derive(Debug, clap::Parser)]
+pub struct TraceSettings {
+    /// Controls when colored output is used.
+    ///
+    /// Valid values:
+    ///
+    /// •  auto (default): Automatically detect if color support is available on the terminal.
+    ///
+    /// •  always: Always display colors.
+    ///
+    /// •  never: Never display colors.
+    #[clap(long, env = "CARGO_TERM_COLORS", default_value = "auto", arg_enum)]
+    color: ColorMode,
 
-    tracing_subscriber::registry()
-        .with(fmt)
-        .with(filter)
-        .try_init()?;
-    Ok(())
+    /// The output format for trace messages and diagnostics.
+    ///
+    /// Valid values:
+    ///
+    /// •  human (default): Display in a human-readable text format.
+    ///
+    /// •  json: Emit JSON-formatted logs.
+    #[clap(long, default_value = "human", arg_enum)]
+    message_format: MessageFormat,
+
+    /// A filter string controlling what traces are enabled.
+    #[clap(long = "trace", default_value = "cargo=info,warn", env = "CARGO_LOG")]
+    filter: tracing_subscriber::EnvFilter,
+}
+
+impl TraceSettings {
+    pub fn message_format(&self) -> MessageFormat {
+        self.message_format
+    }
+
+    pub fn try_init(&mut self) -> Result<()> {
+        let filter = std::mem::take(&mut self.filter);
+        self.try_init_with(filter)
+    }
+
+    pub fn try_init_with(&self, filter: tracing_subscriber::EnvFilter) -> Result<()> {
+        use tracing_subscriber::prelude::*;
+        self.color.set_global();
+        self.message_format.set_global();
+        let fmt = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+        let fmt = match self.message_format {
+            MessageFormat::Human => fmt
+                .event_format(CargoFormatter {
+                    styles: Styles::new(self.color),
+                })
+                .boxed(),
+            MessageFormat::Json => fmt.json().boxed(),
+        };
+
+        tracing_subscriber::registry()
+            .with(fmt)
+            .with(filter)
+            .try_init()?;
+        Ok(())
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, clap::ArgEnum)]
+#[repr(u8)]
+pub enum ColorMode {
+    Auto = 0,
+    Always = 1,
+    Never = 2,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, clap::ArgEnum)]
+#[repr(u8)]
+pub enum MessageFormat {
+    Human = 0,
+    Json = 1,
+}
+
+// === impl ColorMode ===
+
+static GLOBAL_COLOR_MODE: AtomicU8 = AtomicU8::new(0);
+
+impl fmt::Display for ColorMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(self.as_str())
+    }
+}
+
+impl ColorMode {
+    pub fn current() -> Self {
+        match GLOBAL_COLOR_MODE.load(Ordering::Acquire) {
+            x if x == Self::Always as u8 => Self::Always,
+            x if x == Self::Never as u8 => Self::Never,
+            _x => {
+                debug_assert_eq!(_x, Self::Auto as u8, "weird color mode, what the heck?");
+                Self::Auto
+            }
+        }
+    }
+
+    pub fn if_color(self, style: owo_colors::Style) -> owo_colors::Style {
+        if self.should_color_stderr() {
+            style
+        } else {
+            owo_colors::style()
+        }
+    }
+
+    fn set_global(self) {
+        GLOBAL_COLOR_MODE
+            .compare_exchange(0, self as u8, Ordering::AcqRel, Ordering::Acquire)
+            .expect("global color mode already set");
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            ColorMode::Auto => "auto",
+            ColorMode::Always => "always",
+            ColorMode::Never => "never",
+        }
+    }
+
+    // pub fn should_color_stdout(self) -> bool {
+    //     match self {
+    //         ColorMode::Auto => atty::is(atty::Stream::Stdout),
+    //         ColorMode::Always => true,
+    //         ColorMode::Never => false,
+    //     }
+    // }
+
+    pub fn should_color_stderr(self) -> bool {
+        match self {
+            ColorMode::Auto => atty::is(atty::Stream::Stderr),
+            ColorMode::Always => true,
+            ColorMode::Never => false,
+        }
+    }
+}
+
+impl Default for ColorMode {
+    fn default() -> Self {
+        Self::current()
+    }
+}
+
+// === impl MessageFormat ===
+
+impl MessageFormat {
+    pub fn is_json(self) -> bool {
+        self == MessageFormat::Json
+    }
+
+    pub fn current() -> Self {
+        match GLOBAL_COLOR_MODE.load(Ordering::Acquire) {
+            x if x == Self::Human as u8 => Self::Human,
+            x if x == Self::Json as u8 => Self::Json,
+            _x => {
+                #[cfg(debug_assertions)]
+                panic!("weird message format {}", _x);
+
+                #[cfg(not(debug_assertions))]
+                Self::Human
+            }
+        }
+    }
+
+    fn set_global(self) {
+        GLOBAL_COLOR_MODE
+            .compare_exchange(0, self as u8, Ordering::AcqRel, Ordering::Acquire)
+            .expect("global color mode already set");
+    }
+}
+
+impl Default for MessageFormat {
+    fn default() -> Self {
+        Self::current()
+    }
 }
 
 #[derive(Debug)]

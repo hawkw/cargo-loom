@@ -15,7 +15,6 @@ use std::{
 };
 use tokio::task::JoinSet;
 
-mod term;
 mod trace;
 
 #[derive(Debug)]
@@ -133,17 +132,8 @@ struct Args {
     #[clap(long)]
     bins: bool,
 
-    /// Whether to emit colors in output.
-    #[clap(
-        long,
-        possible_values(&["auto", "always", "never"]),
-        env = "CARGO_TERM_COLORS",
-        default_value = "auto"
-    )]
-    color: term::ColorMode,
-
-    #[clap(long, default_value = "cargo_loom=info,warn")]
-    log: tracing_subscriber::EnvFilter,
+    #[clap(flatten)]
+    trace_settings: trace::TraceSettings,
 
     /// If specified, only run tests containing this string in their names
     testname: Option<String>,
@@ -175,8 +165,9 @@ impl App {
     }
 
     fn from_args(mut args: Args) -> color_eyre::Result<Self> {
-        args.color.set_global();
-        trace::try_init(std::mem::take(&mut args.log), args.color).context("initialize tracing")?;
+        args.trace_settings
+            .try_init()
+            .context("initialize tracing")?;
         let metadata = args.metadata()?;
         let target_dir = {
             let mut target_dir = metadata.workspace_root.clone();
@@ -287,6 +278,7 @@ impl App {
     }
 
     pub fn failing_tests(&self, pkg: &cargo_metadata::Package) -> color_eyre::Result<Failed> {
+        let json = self.args.trace_settings.message_format().is_json();
         let tests = self.test_cmd(pkg).run_tests()?;
         let mut failed = Failed::default();
 
@@ -329,45 +321,81 @@ impl App {
             for msg in res {
                 use test::*;
                 match msg.and_then(|msg| msg.decode_custom::<Event>()) {
-                    Ok(Event::Test(Test::Failed(TestFailed { name, .. }))) => {
-                        test_status::<colors::Red>(&name, "failed");
-                        failed.fail_test(&test, name, &self.checkpoint_dir);
+                    Ok(Event::Test(Test::Failed(test_failed))) => {
+                        if json {
+                            serde_json::to_writer(std::io::stderr(), &test_failed)
+                                .context("write json message")?;
+                        } else {
+                            test_status::<colors::Red>(&test_failed.name, "failed");
+                        }
+                        failed.fail_test(&test, test_failed.name, &self.checkpoint_dir);
                         any_failed = true;
                     }
-                    Ok(Event::Test(Test::Ok(TestOk { name, .. }))) => {
-                        test_status::<colors::Green>(&name, "ok")
+                    Ok(Event::Test(Test::Ok(ok))) => {
+                        if json {
+                            serde_json::to_writer(std::io::stderr(), &ok)
+                                .context("write json message")?;
+                        } else {
+                            test_status::<colors::Green>(&ok.name, "ok");
+                        }
                     }
-                    Ok(Event::Test(Test::Ignored(TestIgnored { name, .. }))) => {
-                        test_status::<colors::Yellow>(&name, "ignored")
+                    Ok(Event::Test(Test::Ignored(ignored))) => {
+                        if json {
+                            serde_json::to_writer(std::io::stderr(), &ignored)
+                                .context("write json message")?;
+                        } else {
+                            test_status::<colors::Yellow>(&ignored.name, "ignored")
+                        }
                     }
-                    Ok(Event::Suite(Suite::Started(SuiteStarted { test_count, .. }))) => {
-                        eprintln!("\nrunning {} tests", test_count);
+                    Ok(Event::Suite(Suite::Started(started))) => {
+                        if json {
+                            serde_json::to_writer(std::io::stderr(), &started)
+                                .context("write json message")?;
+                        } else {
+                            eprintln!("\nrunning {} tests", started.test_count);
+                        }
                     }
-                    Ok(Event::Suite(Suite::Ok(SuiteOk {
-                        passed,
-                        failed,
-                        ignored,
-                        measured,
-                        filtered_out,
-                        ..
-                    }))) => {
-                        eprintln!("\ntest result: ok. {passed} passed; {failed} failed; {ignored} ignored; {measured} measured; {filtered_out} filtered out; finished in {:?}", t0.elapsed());
+                    Ok(Event::Suite(Suite::Ok(ok))) => {
+                        if json {
+                            serde_json::to_writer(std::io::stderr(), &ok)
+                                .context("write json message")?;
+                        } else {
+                            let SuiteOk {
+                                passed,
+                                failed,
+                                ignored,
+                                measured,
+                                filtered_out,
+                                ..
+                            } = ok;
+                            eprintln!("\ntest result: ok. {passed} passed; {failed} failed; {ignored} ignored; {measured} measured; {filtered_out} filtered out; finished in {:?}", t0.elapsed());
+                        }
                     }
-                    Ok(Event::Suite(Suite::Failed(SuiteFailed {
-                        passed,
-                        failed,
-                        ignored,
-                        measured,
-                        filtered_out,
-                        ..
-                    }))) => {
-                        eprintln!("\ntest result: FAILED. {passed} passed; {failed} failed; {ignored} ignored; {measured} measured; {filtered_out} filtered out; finished in {:?}", t0.elapsed());
+                    Ok(Event::Suite(Suite::Failed(suite_failed))) => {
+                        if json {
+                            serde_json::to_writer(std::io::stderr(), &suite_failed)
+                                .context("write json message")?;
+                        } else {
+                            let SuiteFailed {
+                                passed,
+                                failed,
+                                ignored,
+                                measured,
+                                filtered_out,
+                                ..
+                            } = suite_failed;
+                            eprintln!("\ntest result: FAILED. {passed} passed; {failed} failed; {ignored} ignored; {measured} measured; {filtered_out} filtered out; finished in {:?}", t0.elapsed());
+                        }
                     }
                     Err(error) => tracing::warn!(
                         suite = %test.name(),
                         %error,
                         "error from test",
                     ),
+                    Ok(msg) if json => {
+                        serde_json::to_writer(std::io::stderr(), &msg)
+                            .context("write json message")?;
+                    }
                     _ => {} // TODO(eliza: do something nice here...
                 }
             }
