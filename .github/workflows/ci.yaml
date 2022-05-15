@@ -47,7 +47,7 @@ jobs:
           command: check
 
   test:
-    name: Tests on ${{ matrix.os }}
+    name: Tests (${{ matrix.rust }} on ${{ matrix.os }})
     needs: check
     runs-on: ${{ matrix.os }}
     strategy:
