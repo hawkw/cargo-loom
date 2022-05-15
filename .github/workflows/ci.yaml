@@ -54,7 +54,7 @@ jobs:
       fail-fast: false
       matrix:
         # test all Rust versions on Ubuntu
-        rust: [stable, nightly, 1.57.0]
+        rust: [stable, nightly, 1.58.0]
         os: [ubuntu-latest]
         # test stable Rust on Windows and MacOS as well
         include:
