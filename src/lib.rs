@@ -20,7 +20,7 @@ mod trace;
 
 #[derive(Debug)]
 pub struct App {
-    args: Args,
+    pub args: Args,
     pub checkpoint_dir: Utf8PathBuf,
     metadata: cargo_metadata::Metadata,
     target_dir: Utf8PathBuf,
@@ -63,7 +63,7 @@ struct FailedTest {
 /// running a large Loom suite much more efficient.
 #[derive(Parser, Debug)]
 #[clap(author, version, about)]
-struct Args {
+pub struct Args {
     /// Path to Cargo.toml
     #[clap(long, env = "CARGO_MANIFEST_PATH", value_hint = clap::ValueHint::FilePath)]
     manifest_path: Option<std::path::PathBuf>,
@@ -172,6 +172,18 @@ impl App {
     }
 
     fn from_args(mut args: Args) -> color_eyre::Result<Self> {
+        color_eyre::config::HookBuilder::default()
+            .issue_url(concat!(env!("CARGO_PKG_REPOSITORY"), "/issues/new"))
+            .add_issue_metadata("version", env!("CARGO_PKG_VERSION"))
+            .add_issue_metadata("args", std::env::args().fold(String::new(), |mut s, arg| {
+                s.push_str(arg.as_str()); s.push(' '); s 
+            }))
+            .issue_filter(|kind| match kind {
+                color_eyre::ErrorKind::NonRecoverable(_) => true,
+                color_eyre::ErrorKind::Recoverable(error) => !error.is::<std::io::Error>(),
+            })
+            .display_env_section(true)
+            .install()?;
         args.trace_settings
             .try_init()
             .context("initialize tracing")?;

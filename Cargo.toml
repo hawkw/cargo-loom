@@ -3,6 +3,7 @@ name = "cargo-loom"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.58"
+repository = "https://github.com/hawkw/cargo-loom"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -12,7 +13,7 @@ camino = "1"
 cargo_metadata = "0.14"
 clap = { version = "3", features = ["derive", "env"] }
 clap-cargo = { version = "0.8", features = ["cargo_metadata"] }
-color-eyre = "0.6"
+color-eyre = { version = "0.6", features = ["issue-url"] }
 escargot = { version = "0.5.7", features = ["test_unstable"] }
 heck = "0.3.3"
 serde = "1"

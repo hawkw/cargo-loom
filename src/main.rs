@@ -4,8 +4,6 @@ use std::process::Output;
 
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
-    color_eyre::install()?;
-
     let app = App::parse()?;
     let wanted_pkgs = app.wanted_packages();
     for pkg in wanted_pkgs {
