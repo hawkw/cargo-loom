@@ -21,7 +21,7 @@ mod trace;
 
 #[derive(Debug)]
 pub struct App {
-    pub args: Args,
+    args: Args,
     pub checkpoint_dir: Utf8PathBuf,
     metadata: cargo_metadata::Metadata,
     target_dir: Utf8PathBuf,
@@ -64,7 +64,7 @@ struct FailedTest {
 /// running a large Loom suite much more efficient.
 #[derive(Parser, Debug)]
 #[clap(author, version, about)]
-pub struct Args {
+struct Args {
     /// Path to Cargo.toml
     #[clap(long, env = "CARGO_MANIFEST_PATH", value_hint = clap::ValueHint::FilePath)]
     manifest_path: Option<std::path::PathBuf>,
