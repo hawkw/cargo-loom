@@ -1,3 +1,4 @@
+#![doc = include_str!("../README.md")]
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::Parser;
 use color_eyre::{
@@ -49,7 +50,7 @@ struct FailedTest {
     checkpoint: Utf8PathBuf,
 }
 
-/// A utility for running Loom tests
+/// A cargo subcommand for automating Loom testing workflows.
 ///
 /// This utility will compile Loom tests, run them once to collect a list of
 /// those tests which fail, generate checkpoint files for all failing tests, and
