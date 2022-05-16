@@ -175,9 +175,14 @@ impl App {
         color_eyre::config::HookBuilder::default()
             .issue_url(concat!(env!("CARGO_PKG_REPOSITORY"), "/issues/new"))
             .add_issue_metadata("version", env!("CARGO_PKG_VERSION"))
-            .add_issue_metadata("args", std::env::args().fold(String::new(), |mut s, arg| {
-                s.push_str(arg.as_str()); s.push(' '); s 
-            }))
+            .add_issue_metadata(
+                "args",
+                std::env::args().fold(String::new(), |mut s, arg| {
+                    s.push_str(arg.as_str());
+                    s.push(' ');
+                    s
+                }),
+            )
             .issue_filter(|kind| match kind {
                 color_eyre::ErrorKind::NonRecoverable(_) => true,
                 color_eyre::ErrorKind::Recoverable(error) => !error.is::<std::io::Error>(),
