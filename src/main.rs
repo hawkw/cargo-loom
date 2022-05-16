@@ -9,13 +9,11 @@ async fn main() -> color_eyre::Result<()> {
     for pkg in wanted_pkgs {
         let mut failing = app
             .failing_tests(pkg)
-            .context("collecting failing tests")
-            .with_note(|| format!("package: {}", pkg.name))?;
+            .with_note(|| format!("Collecting failing tests for package: {}", pkg.name))?;
         let checkpoint_dirs = failing.take_checkpoint_dirs();
         let mut tasks = app
             .run_failed(failing)
-            .context("running failed tests failing tests")
-            .with_note(|| format!("package: {}", pkg.name))?;
+            .with_note(|| format!("Rerunning failed tests for package: {}", pkg.name))?;
         while let Some(result) = tasks.join_one().await? {
             let (name, Output { stdout, .. }) = result?;
             let stdout =
