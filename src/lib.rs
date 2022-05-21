@@ -10,7 +10,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use clap::Parser;
 use color_eyre::{
     eyre::{eyre, WrapErr},
-    Help,
+    Help, Result,
 };
 use escargot::{format::test, CargoTest, CommandMessages};
 use owo_colors::{colors, OwoColorize};
@@ -26,10 +26,14 @@ use tokio::task::JoinSet;
 
 mod trace;
 
+/// The `cargo-loom` command line application.
+///
+/// This type contains everything necessary to run a set of `loom` tests and
+/// display their output.
 #[derive(Debug)]
 pub struct App {
     args: Args,
-    pub checkpoint_dir: Utf8PathBuf,
+    checkpoint_dir: Utf8PathBuf,
     metadata: cargo_metadata::Metadata,
     target_dir: Utf8PathBuf,
     features: String,
@@ -44,10 +48,17 @@ pub struct App {
 }
 
 #[derive(Default)]
-pub struct Failed {
-    failed: HashMap<String, Vec<FailedTest>>,
-    test_cmds: HashMap<String, CargoTest>,
+struct Failed {
+    failed: HashMap<Arc<str>, Vec<FailedTest>>,
+    test_cmds: HashMap<Arc<str>, CargoTest>,
     checkpoint_dirs: HashSet<Utf8PathBuf>,
+    curr_suite_name: Option<Arc<str>>,
+}
+
+#[derive(Debug)]
+struct TestOutput {
+    name: String,
+    output: Output,
 }
 
 #[derive(Debug)]
@@ -164,7 +175,7 @@ const ENV_CHECKPOINT_FILE: &str = "LOOM_CHECKPOINT_FILE";
 const ENV_LOOM_LOCATION: &str = "LOOM_LOCATION";
 
 impl Args {
-    fn metadata(&self) -> color_eyre::Result<cargo_metadata::Metadata> {
+    fn metadata(&self) -> Result<cargo_metadata::Metadata> {
         let mut cmd = cargo_metadata::MetadataCommand::new();
         if let Some(ref manifest_path) = self.manifest_path {
             cmd.manifest_path(manifest_path);
@@ -175,11 +186,279 @@ impl Args {
 }
 
 impl App {
-    pub fn parse() -> color_eyre::Result<Self> {
+    /// Parse an [`App`] configuration from command-line arguments and
+    /// environment variables.
+    pub fn parse() -> Result<Self> {
         Self::from_args(Args::parse())
     }
 
-    fn from_args(mut args: Args) -> color_eyre::Result<Self> {
+    /// Run all tests specified by this `App`'s command-line arguments and print
+    /// the output of any failing tests.
+    pub async fn run_all(&self) -> Result<()> {
+        for pkg in self.wanted_packages() {
+            self.run_package(pkg).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn run_package(&self, pkg: &cargo_metadata::Package) -> Result<()> {
+        let mut failing = self.failing_tests(pkg).with_context(|| {
+            format!("Error collecting failing tests for package `{}`", pkg.name)
+        })?;
+        let mut tasks = self
+            .run_failed(&mut failing)
+            .with_context(|| format!("Error rerunning failing tests for package `{}`", pkg.name))?;
+        while let Some(result) = tasks.join_one().await? {
+            let output = result?;
+            println!("\n --- test {} ---\n\n{}", output.name(), output.stdout()?);
+        }
+
+        for checkpoint_dir in failing.checkpoint_dirs() {
+            tracing::info!(checkpoint_dir = %checkpoint_dir, "Completed loom run");
+        }
+
+        Ok(())
+    }
+
+    fn failing_tests(&self, pkg: &cargo_metadata::Package) -> Result<Failed> {
+        let json = self.args.trace_settings.message_format().is_json();
+        let tests = self.test_cmd(pkg).run_tests()?;
+        let mut failed = Failed::default();
+
+        for suite in tests {
+            let suite = suite.context("Getting next test failed")?;
+
+            let bin_path = suite
+                .path()
+                .file_name()
+                .ok_or_else(|| eyre!("test binary must have a file name"))
+                .and_then(|os_str| {
+                    os_str
+                        .to_str()
+                        .ok_or_else(|| eyre!("binary path was not utf8"))
+                })
+                .with_note(|| format!("bin path: {}", suite.path().display()))?;
+
+            let checkpoint_dir = self.checkpoint_dir.as_path().join(bin_path);
+
+            if suite.kind() == "lib" {
+                tracing::info!(path = %suite.path().display(), "Running unittests")
+            } else {
+                tracing::info!(path = %suite.path().display(), "Running {}", suite.name())
+            }
+
+            let mut cmd = suite.command();
+
+            // Don't enable checkpoints, logging, or location tracking for this
+            // run. Our goal here is *only* to get the names of the failing
+            // tests so we can re-run them individually with their own
+            // checkpoint files.
+            self.configure_loom_command(&mut cmd)
+                .env(ENV_LOOM_LOG, "off");
+
+            // If a test name filter was provided, pass that to the test
+            // command.
+            //
+            // This isn't added by `configure_loom_command`, because we don't
+            // want to set duration limits when re-running with logging etc (as
+            // it may be slower).
+            if let Some(max_duration) = self.max_duration.as_deref() {
+                cmd.env(ENV_MAX_DURATION, max_duration);
+            }
+
+            // If a test name filter was provided, pass that to the test command.
+            if let Some(testname) = self.args.testname.as_deref() {
+                cmd.arg(testname);
+            }
+
+            // If there is already a checkpoint dir for this artifact hash, skip
+            // any previously checkpointed tests.
+            if checkpoint_dir.exists() {
+                (|| {
+                    let mut has_printed = false;
+                    for entry in fs::read_dir(checkpoint_dir.as_std_path())? {
+                        let path = entry?.path();
+                        match path.extension() {
+                            Some(extension) if extension == "json" => {
+                                if let Some(test) = path.file_stem().and_then(OsStr::to_str) {
+                                    // does the test name filter care about
+                                    // this test?
+                                    let is_included = self
+                                        .args
+                                        .testname
+                                        .as_deref()
+                                        .map(|testname| test.contains(testname))
+                                        .unwrap_or(true);
+                                    if is_included {
+                                        cmd.arg("--skip").arg(test);
+                                        failed.fail_test(&suite, test.to_owned(), &checkpoint_dir);
+                                        if !has_printed {
+                                            eprintln!("\npreviously checkpointed");
+                                            has_printed = true;
+                                        }
+
+                                        test_status::<colors::Red>(test, "failed")
+                                    }
+                                }
+                            }
+                            _ => continue,
+                        }
+                    }
+                    Ok::<(), std::io::Error>(())
+                })()
+                .with_context(|| {
+                    format!("failed to read checkpoint directory `{}`", checkpoint_dir)
+                })?;
+            } else {
+                fs::create_dir_all(checkpoint_dir.as_os_str()).with_context(|| {
+                    format!("failed to create checkpoint directory `{}`", checkpoint_dir)
+                })?;
+            }
+
+            let res = CommandMessages::with_command(cmd)
+                .with_note(|| format!("running test suite `{}`", suite.name()))?;
+            let t0 = std::time::Instant::now();
+            for msg in res {
+                use test::*;
+                match msg.and_then(|msg| msg.decode_custom::<Event>()) {
+                    Ok(Event::Test(Test::Failed(test_failed))) => {
+                        if json {
+                            serde_json::to_writer(std::io::stderr(), &test_failed)
+                                .context("write json message")?;
+                        } else {
+                            test_status::<colors::Red>(&test_failed.name, "failed");
+                        }
+                        failed.fail_test(&suite, test_failed.name, &checkpoint_dir);
+                    }
+                    Ok(Event::Test(Test::Ok(ok))) => {
+                        if json {
+                            serde_json::to_writer(std::io::stderr(), &ok)
+                                .context("write json message")?;
+                        } else {
+                            test_status::<colors::Green>(&ok.name, "ok");
+                        }
+                    }
+                    Ok(Event::Test(Test::Ignored(ignored))) => {
+                        if json {
+                            serde_json::to_writer(std::io::stderr(), &ignored)
+                                .context("write json message")?;
+                        } else {
+                            test_status::<colors::Yellow>(&ignored.name, "ignored")
+                        }
+                    }
+                    Ok(Event::Suite(Suite::Started(started))) => {
+                        if json {
+                            serde_json::to_writer(std::io::stderr(), &started)
+                                .context("write json message")?;
+                        } else {
+                            eprintln!("\nrunning {} tests", started.test_count);
+                        }
+                    }
+                    Ok(Event::Suite(Suite::Ok(ok))) => {
+                        if json {
+                            serde_json::to_writer(std::io::stderr(), &ok)
+                                .context("write json message")?;
+                        } else {
+                            let SuiteOk {
+                                passed,
+                                failed,
+                                ignored,
+                                measured,
+                                filtered_out,
+                                ..
+                            } = ok;
+                            eprintln!("\ntest result: ok. {passed} passed; {failed} failed; {ignored} ignored; {measured} measured; {filtered_out} filtered out; finished in {:?}", t0.elapsed());
+                        }
+                    }
+                    Ok(Event::Suite(Suite::Failed(suite_failed))) => {
+                        if json {
+                            serde_json::to_writer(std::io::stderr(), &suite_failed)
+                                .context("write json message")?;
+                        } else {
+                            let SuiteFailed {
+                                passed,
+                                failed,
+                                ignored,
+                                measured,
+                                filtered_out,
+                                ..
+                            } = suite_failed;
+                            eprintln!("\ntest result: FAILED. {passed} passed; {failed} failed; {ignored} ignored; {measured} measured; {filtered_out} filtered out; finished in {:?}", t0.elapsed());
+                        }
+                    }
+                    Err(error) => tracing::warn!(
+                        suite = %suite.name(),
+                        %error,
+                        "error from test",
+                    ),
+                    Ok(msg) if json => {
+                        serde_json::to_writer(std::io::stderr(), &msg)
+                            .context("write json message")?;
+                    }
+                    _ => {} // TODO(eliza: do something nice here...
+                }
+            }
+
+            failed.finish_suite(suite);
+        }
+
+        Ok(failed)
+    }
+
+    fn run_failed(&self, failed: &mut Failed) -> Result<JoinSet<Result<TestOutput>>> {
+        let mut tasks = JoinSet::new();
+        for (suite, tests) in failed.failed.drain() {
+            let suite = failed
+                .test_cmds
+                .get(&suite)
+                .ok_or_else(|| eyre!("missing test command for suite `{}`", suite))?;
+            for FailedTest { name, checkpoint } in tests {
+                let mut cmd = Command::new(suite.path());
+                self.configure_loom_command(&mut cmd)
+                    .env(ENV_CHECKPOINT_INTERVAL, &self.checkpoint_interval)
+                    .env(ENV_CHECKPOINT_FILE, &checkpoint)
+                    .arg(&name);
+                let loom_log = self.loom_log.clone();
+                let pretty_name = format!("{suite}::{name}", suite = suite.name());
+                let task = async move {
+                    let t0 = Instant::now();
+                    let mut cmd = tokio::process::Command::from(cmd);
+                    if checkpoint.exists() {
+                        tracing::debug!(test = %pretty_name, "Already checkpointed", )
+                    } else {
+                        tracing::info!(test = %pretty_name, "Generating checkpoint");
+                        tracing::trace!(?cmd);
+                        let _ = cmd
+                            .stderr(Stdio::null())
+                            .stdout(Stdio::null())
+                            .status()
+                            .await
+                            .with_context(|| format!("spawn process to checkpoint {pretty_name}"));
+                        let elapsed = t0.elapsed();
+                        tracing::debug!(test = %pretty_name, ?elapsed, file = %checkpoint, "checkpointed");
+                    }
+
+                    // now, run it again with logging
+                    let output = cmd
+                        .env(ENV_LOOM_LOG, loom_log.as_ref())
+                        .env(ENV_LOOM_LOCATION, "1")
+                        .output()
+                        .await
+                        .with_context(|| format!("spawn process to rerun {pretty_name}"))?;
+                    let output = TestOutput {
+                        name: pretty_name,
+                        output,
+                    };
+                    Ok(output)
+                };
+                tasks.spawn(task);
+            }
+        }
+        Ok(tasks)
+    }
+
+    fn from_args(mut args: Args) -> Result<Self> {
         color_eyre::config::HookBuilder::default()
             .issue_url(concat!(env!("CARGO_PKG_REPOSITORY"), "/issues/new"))
             .add_issue_metadata("version", env!("CARGO_PKG_VERSION"))
@@ -271,7 +550,7 @@ impl App {
         })
     }
 
-    pub fn wanted_packages(&self) -> Vec<&cargo_metadata::Package> {
+    fn wanted_packages(&self) -> Vec<&cargo_metadata::Package> {
         self.args.workspace.partition_packages(&self.metadata).0
     }
 
@@ -326,247 +605,6 @@ impl App {
 
         cmd
     }
-
-    pub fn failing_tests(&self, pkg: &cargo_metadata::Package) -> color_eyre::Result<Failed> {
-        let json = self.args.trace_settings.message_format().is_json();
-        let tests = self.test_cmd(pkg).run_tests()?;
-        let mut failed = Failed::default();
-
-        for suite in tests {
-            let mut any_failed = false;
-            let suite = suite.context("Getting next test failed")?;
-
-            let bin_path = suite
-                .path()
-                .file_name()
-                .ok_or_else(|| eyre!("test binary must have a file name"))
-                .and_then(|os_str| {
-                    os_str
-                        .to_str()
-                        .ok_or_else(|| eyre!("binary path was not utf8"))
-                })
-                .with_note(|| format!("bin path: {}", suite.path().display()))?;
-
-            let checkpoint_dir = self.checkpoint_dir.as_path().join(bin_path);
-
-            if suite.kind() == "lib" {
-                tracing::info!(path = %suite.path().display(), "Running unittests")
-            } else {
-                tracing::info!(path = %suite.path().display(), "Running {}", suite.name())
-            }
-
-            let mut cmd = suite.command();
-
-            // Don't enable checkpoints, logging, or location tracking for this
-            // run. Our goal here is *only* to get the names of the failing
-            // tests so we can re-run them individually with their own
-            // checkpoint files.
-            self.configure_loom_command(&mut cmd)
-                .env(ENV_LOOM_LOG, "off");
-
-            // If a test name filter was provided, pass that to the test
-            // command.
-            //
-            // This isn't added by `configure_loom_command`, because we don't
-            // want to set duration limits when re-running with logging etc (as
-            // it may be slower).
-            if let Some(max_duration) = self.max_duration.as_deref() {
-                cmd.env(ENV_MAX_DURATION, max_duration);
-            }
-
-            // If a test name filter was provided, pass that to the test command.
-            if let Some(testname) = self.args.testname.as_deref() {
-                cmd.arg(testname);
-            }
-
-            // If there is already a checkpoint dir for this artifact hash, skip
-            // any previously checkpointed tests.
-            if checkpoint_dir.exists() {
-                (|| {
-                    let mut has_printed = false;
-                    for entry in fs::read_dir(checkpoint_dir.as_std_path())? {
-                        let path = entry?.path();
-                        match path.extension() {
-                            Some(extension) if extension == "json" => {
-                                if let Some(test) = path.file_stem().and_then(OsStr::to_str) {
-                                    // does the test name filter care about
-                                    // this test?
-                                    let is_included = self
-                                        .args
-                                        .testname
-                                        .as_deref()
-                                        .map(|testname| test.contains(testname))
-                                        .unwrap_or(true);
-                                    if is_included {
-                                        cmd.arg("--skip").arg(test);
-                                        failed.fail_test(&suite, test.to_owned(), &checkpoint_dir);
-                                        any_failed = true;
-                                        if !has_printed {
-                                            eprintln!("\npreviously checkpointed");
-                                            has_printed = true;
-                                        }
-
-                                        test_status::<colors::Red>(test, "failed")
-                                    }
-                                }
-                            }
-                            _ => continue,
-                        }
-                    }
-                    Ok::<(), std::io::Error>(())
-                })()
-                .with_context(|| {
-                    format!("failed to read checkpoint directory `{}`", checkpoint_dir)
-                })?;
-            } else {
-                fs::create_dir_all(checkpoint_dir.as_os_str()).with_context(|| {
-                    format!("failed to create checkpoint directory `{}`", checkpoint_dir)
-                })?;
-            }
-
-            let res = CommandMessages::with_command(cmd)
-                .with_note(|| format!("running test suite `{}`", suite.name()))?;
-            let t0 = std::time::Instant::now();
-            for msg in res {
-                use test::*;
-                match msg.and_then(|msg| msg.decode_custom::<Event>()) {
-                    Ok(Event::Test(Test::Failed(test_failed))) => {
-                        if json {
-                            serde_json::to_writer(std::io::stderr(), &test_failed)
-                                .context("write json message")?;
-                        } else {
-                            test_status::<colors::Red>(&test_failed.name, "failed");
-                        }
-                        failed.fail_test(&suite, test_failed.name, &checkpoint_dir);
-                        any_failed = true;
-                    }
-                    Ok(Event::Test(Test::Ok(ok))) => {
-                        if json {
-                            serde_json::to_writer(std::io::stderr(), &ok)
-                                .context("write json message")?;
-                        } else {
-                            test_status::<colors::Green>(&ok.name, "ok");
-                        }
-                    }
-                    Ok(Event::Test(Test::Ignored(ignored))) => {
-                        if json {
-                            serde_json::to_writer(std::io::stderr(), &ignored)
-                                .context("write json message")?;
-                        } else {
-                            test_status::<colors::Yellow>(&ignored.name, "ignored")
-                        }
-                    }
-                    Ok(Event::Suite(Suite::Started(started))) => {
-                        if json {
-                            serde_json::to_writer(std::io::stderr(), &started)
-                                .context("write json message")?;
-                        } else {
-                            eprintln!("\nrunning {} tests", started.test_count);
-                        }
-                    }
-                    Ok(Event::Suite(Suite::Ok(ok))) => {
-                        if json {
-                            serde_json::to_writer(std::io::stderr(), &ok)
-                                .context("write json message")?;
-                        } else {
-                            let SuiteOk {
-                                passed,
-                                failed,
-                                ignored,
-                                measured,
-                                filtered_out,
-                                ..
-                            } = ok;
-                            eprintln!("\ntest result: ok. {passed} passed; {failed} failed; {ignored} ignored; {measured} measured; {filtered_out} filtered out; finished in {:?}", t0.elapsed());
-                        }
-                    }
-                    Ok(Event::Suite(Suite::Failed(suite_failed))) => {
-                        if json {
-                            serde_json::to_writer(std::io::stderr(), &suite_failed)
-                                .context("write json message")?;
-                        } else {
-                            let SuiteFailed {
-                                passed,
-                                failed,
-                                ignored,
-                                measured,
-                                filtered_out,
-                                ..
-                            } = suite_failed;
-                            eprintln!("\ntest result: FAILED. {passed} passed; {failed} failed; {ignored} ignored; {measured} measured; {filtered_out} filtered out; finished in {:?}", t0.elapsed());
-                        }
-                    }
-                    Err(error) => tracing::warn!(
-                        suite = %suite.name(),
-                        %error,
-                        "error from test",
-                    ),
-                    Ok(msg) if json => {
-                        serde_json::to_writer(std::io::stderr(), &msg)
-                            .context("write json message")?;
-                    }
-                    _ => {} // TODO(eliza: do something nice here...
-                }
-            }
-
-            if any_failed {
-                failed.test_cmds.insert(suite.name().to_string(), suite);
-            }
-        }
-
-        Ok(failed)
-    }
-
-    pub fn run_failed(
-        &self,
-        failed: Failed,
-    ) -> color_eyre::Result<JoinSet<color_eyre::Result<(String, Output)>>> {
-        let mut tasks = JoinSet::new();
-        for (suite, tests) in failed.failed {
-            let suite = failed
-                .test_cmds
-                .get(&suite)
-                .ok_or_else(|| eyre!("missing test command for suite `{}`", suite))?;
-            for FailedTest { name, checkpoint } in tests {
-                let mut cmd = Command::new(suite.path());
-                self.configure_loom_command(&mut cmd)
-                    .env(ENV_CHECKPOINT_INTERVAL, &self.checkpoint_interval)
-                    .env(ENV_CHECKPOINT_FILE, &checkpoint)
-                    .arg(&name);
-                let loom_log = self.loom_log.clone();
-                let pretty_name = format!("{suite}::{name}", suite = suite.name());
-                let task = async move {
-                    let t0 = Instant::now();
-                    let mut cmd = tokio::process::Command::from(cmd);
-                    if checkpoint.exists() {
-                        tracing::debug!(test = %pretty_name, "Already checkpointed", )
-                    } else {
-                        tracing::info!(test = %pretty_name, "Generating checkpoint");
-                        tracing::trace!(?cmd);
-                        let _ = cmd
-                            .stderr(Stdio::null())
-                            .stdout(Stdio::null())
-                            .status()
-                            .await
-                            .with_context(|| format!("spawn process to checkpoint {pretty_name}"));
-                        let elapsed = t0.elapsed();
-                        tracing::debug!(test = %pretty_name, ?elapsed, file = %checkpoint, "checkpointed");
-                    }
-
-                    // now, run it again with logging
-                    let output = cmd
-                        .env(ENV_LOOM_LOG, loom_log.as_ref())
-                        .env(ENV_LOOM_LOCATION, "1")
-                        .output()
-                        .await
-                        .with_context(|| format!("spawn process to rerun {pretty_name}"))?;
-                    Ok((pretty_name, output))
-                };
-                tasks.spawn(task);
-            }
-        }
-        Ok(tasks)
-    }
 }
 
 impl FailedTest {
@@ -583,8 +621,8 @@ impl fmt::Display for FailedTest {
 }
 
 impl Failed {
-    pub fn take_checkpoint_dirs(&mut self) -> HashSet<Utf8PathBuf> {
-        std::mem::take(&mut self.checkpoint_dirs)
+    pub fn checkpoint_dirs(&self) -> &HashSet<Utf8PathBuf> {
+        &self.checkpoint_dirs
     }
 
     fn fail_test(
@@ -597,11 +635,40 @@ impl Failed {
         if !self.checkpoint_dirs.contains(checkpoint_dir) {
             self.checkpoint_dirs.insert(checkpoint_dir.to_path_buf());
         }
+        let suite_name = self
+            .curr_suite_name
+            .get_or_insert_with(|| Arc::from(suite.name().to_owned()))
+            .clone();
+        debug_assert_eq!(suite_name.as_ref(), suite.name());
         self.failed
-            .entry(suite.name().to_owned())
+            .entry(suite_name)
             .or_default()
             .push(FailedTest::new(test_name, checkpoint_dir));
     }
+
+    fn finish_suite(&mut self, suite: CargoTest) {
+        if let Some(suite_name) = self.curr_suite_name.take() {
+            self.test_cmds.insert(suite_name, suite);
+        }
+    }
+}
+
+// === impl TestOutput ===
+
+impl TestOutput {
+    fn name(&self) -> &str {
+        self.name.as_str()
+    }
+
+    fn stdout(&self) -> Result<&str> {
+        std::str::from_utf8(&self.output.stdout[..])
+            .with_context(|| format!("stdout from test `{}` was not utf8", self.name))
+    }
+
+    // fn stderr(&self) -> Result<&str> {
+    //     std::str::from_utf8(&self.output.stderr[..])
+    //         .with_context(|| format!("stderr from test `{}` was not utf8", self.name))
+    // }
 }
 
 fn test_status<C: owo_colors::Color>(name: &str, status: &str) {
