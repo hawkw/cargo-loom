@@ -649,19 +649,19 @@ impl Failed {
 // === impl TestOutput ===
 
 impl TestOutput {
-    pub fn name(&self) -> &str {
+    fn name(&self) -> &str {
         self.name.as_str()
     }
 
-    pub fn stdout(&self) -> Result<&str> {
+    fn stdout(&self) -> Result<&str> {
         std::str::from_utf8(&self.output.stdout[..])
             .with_context(|| format!("stdout from test `{}` was not utf8", self.name))
     }
 
-    pub fn stderr(&self) -> Result<&str> {
-        std::str::from_utf8(&self.output.stderr[..])
-            .with_context(|| format!("stderr from test `{}` was not utf8", self.name))
-    }
+    // fn stderr(&self) -> Result<&str> {
+    //     std::str::from_utf8(&self.output.stderr[..])
+    //         .with_context(|| format!("stderr from test `{}` was not utf8", self.name))
+    // }
 }
 
 fn test_status<C: owo_colors::Color>(name: &str, status: &str) {
