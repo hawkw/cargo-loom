@@ -185,20 +185,25 @@ impl App {
             )
             .issue_filter(|kind| match kind {
                 color_eyre::ErrorKind::NonRecoverable(_) => true,
-                color_eyre::ErrorKind::Recoverable(error) => 
-                    // Skip any IO errors and any errors forwarded from a cargo
-                    // subcommand, as these may not be our fault.
-                    error_is_issue(error),
+                color_eyre::ErrorKind::Recoverable(error) =>
+                // Skip any IO errors and any errors forwarded from a cargo
+                // subcommand, as these may not be our fault.
+                {
+                    error_is_issue(error)
+                }
             })
             .display_env_section(true)
             .add_default_filters()
             .add_frame_filter(Box::new(|frames| {
-                const SKIPPED: &[&str] = &["tokio::runtime", "tokio::coop", "tokio::park", "std::thread::local"];
-                frames.retain(|frame| {
-                    match frame.name.as_ref() {
-                        Some(name) => !SKIPPED.iter().any(|prefix| name.starts_with(prefix)),
-                        None => true,
-                    }
+                const SKIPPED: &[&str] = &[
+                    "tokio::runtime",
+                    "tokio::coop",
+                    "tokio::park",
+                    "std::thread::local",
+                ];
+                frames.retain(|frame| match frame.name.as_ref() {
+                    Some(name) => !SKIPPED.iter().any(|prefix| name.starts_with(prefix)),
+                    None => true,
                 })
             }))
             .install()?;
@@ -610,4 +615,4 @@ fn error_is_issue(error: &(dyn std::error::Error + 'static)) -> bool {
     }
 
     true
-} 
+}
