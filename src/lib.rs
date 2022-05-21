@@ -220,7 +220,6 @@ impl App {
         let mut failed = Failed::default();
 
         for suite in tests {
-            let mut any_failed = false;
             let suite = suite.context("Getting next test failed")?;
 
             let bin_path = suite
