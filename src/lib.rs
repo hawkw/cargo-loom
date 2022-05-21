@@ -19,10 +19,14 @@ use tokio::task::JoinSet;
 
 mod trace;
 
+/// The `cargo-loom` command line application.
+///
+/// This type contains everything necessary to run a set of `loom` tests and
+/// display their output.
 #[derive(Debug)]
 pub struct App {
     args: Args,
-    pub(crate) checkpoint_dir: Utf8PathBuf,
+    checkpoint_dir: Utf8PathBuf,
     metadata: cargo_metadata::Metadata,
     target_dir: Utf8PathBuf,
     features: String,
@@ -37,7 +41,7 @@ pub struct App {
 }
 
 #[derive(Default)]
-pub struct Failed {
+struct Failed {
     failed: HashMap<Arc<str>, Vec<FailedTest>>,
     test_cmds: HashMap<Arc<str>, CargoTest>,
     checkpoint_dirs: HashSet<Utf8PathBuf>,
@@ -45,7 +49,7 @@ pub struct Failed {
 }
 
 #[derive(Debug)]
-pub struct TestOutput {
+struct TestOutput {
     name: String,
     output: Output,
 }
@@ -175,10 +179,14 @@ impl Args {
 }
 
 impl App {
+    /// Parse an [`App`] configuration from command-line arguments and
+    /// environment variables.
     pub fn parse() -> Result<Self> {
         Self::from_args(Args::parse())
     }
 
+    /// Run all tests specified by this `App`'s command-line arguments and print
+    /// the output of any failing tests.
     pub async fn run_all(&self) -> Result<()> {
         for pkg in self.wanted_packages() {
             self.run_package(pkg).await?;
