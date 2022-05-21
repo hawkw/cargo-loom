@@ -201,6 +201,7 @@ struct Visitor<'styles, 'writer> {
     is_empty: bool,
     styles: &'styles Styles,
     did_cargo_format: bool,
+    from_escargot: bool,
 }
 
 #[derive(Debug)]
@@ -230,11 +231,14 @@ where
         mut writer: Writer<'_>,
         event: &Event<'_>,
     ) -> fmt::Result {
+        const LOG_TARGET: &str = "log.target";
+
         let metadata = event.metadata();
         let level = metadata.level();
+        let from_escargot = metadata.fields().field(LOG_TARGET).is_some();
 
         let include_spans = {
-            let mut visitor = self.visitor(*level, writer.by_ref());
+            let mut visitor = self.visitor(*level, writer.by_ref(), from_escargot);
             event.record(&mut visitor);
             !visitor.did_cargo_format && ctx.lookup_current().is_some()
         };
@@ -277,6 +281,7 @@ impl CargoFormatter {
         &'styles self,
         level: Level,
         writer: Writer<'writer>,
+        from_escargot: bool,
     ) -> Visitor<'styles, 'writer> {
         Visitor {
             level,
@@ -284,6 +289,7 @@ impl CargoFormatter {
             is_empty: true,
             styles: &self.styles,
             did_cargo_format: false,
+            from_escargot,
         }
     }
 }
@@ -297,13 +303,19 @@ impl<'styles, 'writer> Visitor<'styles, 'writer> {
 
 impl<'styles, 'writer> Visit for Visitor<'styles, 'writer> {
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        let name = field.name();
+
+        if name.starts_with("log.") {
+            return;
+        }
+
         // If we're writing the first field of the event, either emit cargo
         // formatting, or a level header.
         if self.is_empty {
             // If the level is `INFO` and it has a message that's
             // shaped like a cargo log tag, emit the cargo tag followed by the
             // rest of the message.
-            if self.level == Level::INFO && field.name() == Self::MESSAGE {
+            if self.level == Level::INFO && name == Self::MESSAGE {
                 let message = format!("{:?}", value);
                 if let Some((tag, message)) = message.as_str().split_once(' ') {
                     if tag.len() <= Self::INDENT {
@@ -326,6 +338,33 @@ impl<'styles, 'writer> Visit for Visitor<'styles, 'writer> {
                         return;
                     }
                 }
+            }
+
+            // Handle forwarded cargo output from escargot.
+            if name == Self::MESSAGE && self.from_escargot {
+                let message = format!("{:?}", value);
+
+                let message = if let Some(message) = message.strip_prefix("error") {
+                    let _ = write!(self.writer, "{}", "error".style(self.styles.error));
+                    message
+                } else if let Some(message) = message.strip_prefix("warning") {
+                    let _ = write!(self.writer, "{}", "warning".style(self.styles.warn));
+                    message
+                } else {
+                    message.as_str()
+                };
+
+                let mut lines = message.lines();
+                if let Some(first_line) = lines.next() {
+                    let _ = writeln!(self.writer, "{}", first_line.style(self.styles.bold));
+                    for line in lines {
+                        let _ = self.writer.write_str(line);
+                        let _ = self.writer.write_char('\n');
+                    }
+                }
+
+                self.is_empty = false;
+                return;
             }
 
             // Otherwise, emit a level tag.
@@ -367,13 +406,13 @@ impl<'styles, 'writer> Visit for Visitor<'styles, 'writer> {
             let _ = self.writer.write_str(", ");
         }
 
-        if field.name() == Self::MESSAGE {
+        if name == Self::MESSAGE {
             let _ = write!(self.writer, "{:?}", value.style(self.styles.bold));
         } else {
             let _ = write!(
                 self.writer,
                 "{}{} {:?}",
-                field.name().style(self.styles.bold),
+                name.style(self.styles.bold),
                 ":".style(self.styles.bold),
                 value
             );

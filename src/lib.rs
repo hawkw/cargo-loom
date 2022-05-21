@@ -186,9 +186,27 @@ impl App {
             )
             .issue_filter(|kind| match kind {
                 color_eyre::ErrorKind::NonRecoverable(_) => true,
-                color_eyre::ErrorKind::Recoverable(error) => !error.is::<std::io::Error>(),
+                color_eyre::ErrorKind::Recoverable(error) =>
+                // Skip any IO errors and any errors forwarded from a cargo
+                // subcommand, as these may not be our fault.
+                {
+                    error_is_issue(error)
+                }
             })
             .display_env_section(true)
+            .add_default_filters()
+            .add_frame_filter(Box::new(|frames| {
+                const SKIPPED: &[&str] = &[
+                    "tokio::runtime",
+                    "tokio::coop",
+                    "tokio::park",
+                    "std::thread::local",
+                ];
+                frames.retain(|frame| match frame.name.as_ref() {
+                    Some(name) => !SKIPPED.iter().any(|prefix| name.starts_with(prefix)),
+                    None => true,
+                })
+            }))
             .install()?;
         args.trace_settings
             .try_init()
@@ -309,7 +327,7 @@ impl App {
 
         for suite in tests {
             let mut any_failed = false;
-            let suite = suite.context("getting next test failed")?;
+            let suite = suite.context("Getting next test failed")?;
 
             let bin_path = suite
                 .path()
@@ -585,4 +603,17 @@ fn test_status<C: owo_colors::Color>(name: &str, status: &str) {
         name,
         status.if_supports_color(owo_colors::Stream::Stderr, |text| text.fg::<C>())
     )
+}
+
+fn error_is_issue(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current.take() {
+        if error.is::<std::io::Error>() || error.is::<escargot::error::CargoError>() {
+            return false;
+        }
+
+        current = error.source();
+    }
+
+    true
 }
