@@ -1,3 +1,4 @@
+#![doc = include_str!("../README.md")]
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::Parser;
 use color_eyre::{
@@ -20,7 +21,7 @@ mod trace;
 
 #[derive(Debug)]
 pub struct App {
-    pub args: Args,
+    args: Args,
     pub checkpoint_dir: Utf8PathBuf,
     metadata: cargo_metadata::Metadata,
     target_dir: Utf8PathBuf,
@@ -49,7 +50,7 @@ struct FailedTest {
     checkpoint: Utf8PathBuf,
 }
 
-/// A utility for running Loom tests
+/// A cargo subcommand for automating Loom testing workflows.
 ///
 /// This utility will compile Loom tests, run them once to collect a list of
 /// those tests which fail, generate checkpoint files for all failing tests, and
@@ -63,7 +64,7 @@ struct FailedTest {
 /// running a large Loom suite much more efficient.
 #[derive(Parser, Debug)]
 #[clap(author, version, about)]
-pub struct Args {
+struct Args {
     /// Path to Cargo.toml
     #[clap(long, env = "CARGO_MANIFEST_PATH", value_hint = clap::ValueHint::FilePath)]
     manifest_path: Option<std::path::PathBuf>,
