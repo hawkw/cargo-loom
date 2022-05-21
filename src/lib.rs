@@ -179,154 +179,6 @@ impl App {
         Self::from_args(Args::parse())
     }
 
-    fn from_args(mut args: Args) -> Result<Self> {
-        color_eyre::config::HookBuilder::default()
-            .issue_url(concat!(env!("CARGO_PKG_REPOSITORY"), "/issues/new"))
-            .add_issue_metadata("version", env!("CARGO_PKG_VERSION"))
-            .add_issue_metadata(
-                "args",
-                std::env::args().fold(String::new(), |mut s, arg| {
-                    s.push_str(arg.as_str());
-                    s.push(' ');
-                    s
-                }),
-            )
-            .issue_filter(|kind| match kind {
-                color_eyre::ErrorKind::NonRecoverable(_) => true,
-                color_eyre::ErrorKind::Recoverable(error) =>
-                // Skip any IO errors and any errors forwarded from a cargo
-                // subcommand, as these may not be our fault.
-                {
-                    error_is_issue(error)
-                }
-            })
-            .display_env_section(true)
-            .add_default_filters()
-            .add_frame_filter(Box::new(|frames| {
-                const SKIPPED: &[&str] = &[
-                    "tokio::runtime",
-                    "tokio::coop",
-                    "tokio::park",
-                    "std::thread::local",
-                ];
-                frames.retain(|frame| match frame.name.as_ref() {
-                    Some(name) => !SKIPPED.iter().any(|prefix| name.starts_with(prefix)),
-                    None => true,
-                })
-            }))
-            .install()?;
-        args.trace_settings
-            .try_init()
-            .context("initialize tracing")?;
-        let metadata = args.metadata()?;
-        let target_dir = {
-            let mut target_dir = metadata.workspace_root.clone();
-            target_dir.push("target");
-            target_dir.push("loom");
-            target_dir
-        };
-        let checkpoint_dir = target_dir.as_path().join("checkpoint");
-        fs::create_dir_all(checkpoint_dir.as_os_str())
-            .with_context(|| format!("creating checkpoint directory `{}`", checkpoint_dir))?;
-
-        let mut features = String::new();
-        let mut feature_list = args.features.features.iter();
-        if let Some(feature) = feature_list.next() {
-            features.push_str(feature);
-            for feature in feature_list {
-                features.push(' ');
-                features.push_str(feature);
-            }
-        }
-        let mut rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
-        if !rustflags.is_empty() {
-            rustflags.push(' ');
-        }
-        rustflags.push_str("--cfg loom --cfg debug_assertions");
-
-        // These all need to be represented as strings to pass them as env
-        // variables. Format them a single time so we don't have to do it every
-        // time we run a test.
-        let max_duration = args.max_duration_secs.as_ref().map(ToString::to_string);
-        let max_permutations = args.max_permutations.as_ref().map(ToString::to_string);
-        let max_branches = args.max_branches.to_string();
-        let max_threads = args.max_threads.to_string();
-        let checkpoint_interval = args.checkpoint_interval.to_string();
-        let loom_log = Arc::from(args.loom_log.clone());
-        let test_args = Arc::from(args.test_args.clone());
-        Ok(Self {
-            args,
-            metadata,
-            target_dir,
-            checkpoint_dir,
-            features,
-            rustflags,
-            max_branches,
-            max_duration,
-            max_permutations,
-            max_threads,
-            checkpoint_interval,
-            loom_log,
-            test_args,
-        })
-    }
-
-    fn wanted_packages(&self) -> Vec<&cargo_metadata::Package> {
-        self.args.workspace.partition_packages(&self.metadata).0
-    }
-
-    fn test_cmd(&self, pkg: &cargo_metadata::Package) -> escargot::CargoBuild {
-        let mut cmd = escargot::Cargo::new()
-            .build_with("test")
-            .arg("--no-run")
-            .env("RUSTFLAGS", &self.rustflags)
-            .target_dir(&self.target_dir)
-            .package(&pkg.name)
-            .release();
-
-        if self.args.lib {
-            cmd = cmd.arg("--lib");
-        }
-
-        if self.args.tests || !self.args.lib {
-            cmd = cmd.tests()
-        }
-
-        if self.args.features.all_features {
-            cmd = cmd.all_features()
-        }
-
-        if self.args.features.no_default_features {
-            cmd = cmd.no_default_features();
-        }
-
-        if !&self.args.features.features.is_empty() {
-            cmd = cmd.features(&self.features)
-        }
-
-        if let Some(manifest) = self.args.manifest_path.as_deref() {
-            cmd = cmd.manifest_path(manifest);
-        }
-
-        cmd
-    }
-
-    fn configure_loom_command<'cmd>(&self, cmd: &'cmd mut Command) -> &'cmd mut Command {
-        cmd.env(ENV_MAX_BRANCHES, &self.max_branches);
-
-        if let Some(max_permutations) = self.max_permutations.as_deref() {
-            cmd.env(ENV_MAX_PERMUTATIONS, max_permutations);
-        }
-
-        cmd.env(ENV_MAX_THREADS, &self.max_threads);
-
-        if !self.test_args.is_empty() {
-            cmd.args(&self.test_args[..]);
-        }
-
-        cmd
-    }
-
     pub async fn run_all(&self) -> Result<()> {
         for pkg in self.wanted_packages() {
             self.run_package(pkg).await?;
@@ -590,6 +442,154 @@ impl App {
             }
         }
         Ok(tasks)
+    }
+
+    fn from_args(mut args: Args) -> Result<Self> {
+        color_eyre::config::HookBuilder::default()
+            .issue_url(concat!(env!("CARGO_PKG_REPOSITORY"), "/issues/new"))
+            .add_issue_metadata("version", env!("CARGO_PKG_VERSION"))
+            .add_issue_metadata(
+                "args",
+                std::env::args().fold(String::new(), |mut s, arg| {
+                    s.push_str(arg.as_str());
+                    s.push(' ');
+                    s
+                }),
+            )
+            .issue_filter(|kind| match kind {
+                color_eyre::ErrorKind::NonRecoverable(_) => true,
+                color_eyre::ErrorKind::Recoverable(error) =>
+                // Skip any IO errors and any errors forwarded from a cargo
+                // subcommand, as these may not be our fault.
+                {
+                    error_is_issue(error)
+                }
+            })
+            .display_env_section(true)
+            .add_default_filters()
+            .add_frame_filter(Box::new(|frames| {
+                const SKIPPED: &[&str] = &[
+                    "tokio::runtime",
+                    "tokio::coop",
+                    "tokio::park",
+                    "std::thread::local",
+                ];
+                frames.retain(|frame| match frame.name.as_ref() {
+                    Some(name) => !SKIPPED.iter().any(|prefix| name.starts_with(prefix)),
+                    None => true,
+                })
+            }))
+            .install()?;
+        args.trace_settings
+            .try_init()
+            .context("initialize tracing")?;
+        let metadata = args.metadata()?;
+        let target_dir = {
+            let mut target_dir = metadata.workspace_root.clone();
+            target_dir.push("target");
+            target_dir.push("loom");
+            target_dir
+        };
+        let checkpoint_dir = target_dir.as_path().join("checkpoint");
+        fs::create_dir_all(checkpoint_dir.as_os_str())
+            .with_context(|| format!("creating checkpoint directory `{}`", checkpoint_dir))?;
+
+        let mut features = String::new();
+        let mut feature_list = args.features.features.iter();
+        if let Some(feature) = feature_list.next() {
+            features.push_str(feature);
+            for feature in feature_list {
+                features.push(' ');
+                features.push_str(feature);
+            }
+        }
+        let mut rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
+        if !rustflags.is_empty() {
+            rustflags.push(' ');
+        }
+        rustflags.push_str("--cfg loom --cfg debug_assertions");
+
+        // These all need to be represented as strings to pass them as env
+        // variables. Format them a single time so we don't have to do it every
+        // time we run a test.
+        let max_duration = args.max_duration_secs.as_ref().map(ToString::to_string);
+        let max_permutations = args.max_permutations.as_ref().map(ToString::to_string);
+        let max_branches = args.max_branches.to_string();
+        let max_threads = args.max_threads.to_string();
+        let checkpoint_interval = args.checkpoint_interval.to_string();
+        let loom_log = Arc::from(args.loom_log.clone());
+        let test_args = Arc::from(args.test_args.clone());
+        Ok(Self {
+            args,
+            metadata,
+            target_dir,
+            checkpoint_dir,
+            features,
+            rustflags,
+            max_branches,
+            max_duration,
+            max_permutations,
+            max_threads,
+            checkpoint_interval,
+            loom_log,
+            test_args,
+        })
+    }
+
+    fn wanted_packages(&self) -> Vec<&cargo_metadata::Package> {
+        self.args.workspace.partition_packages(&self.metadata).0
+    }
+
+    fn test_cmd(&self, pkg: &cargo_metadata::Package) -> escargot::CargoBuild {
+        let mut cmd = escargot::Cargo::new()
+            .build_with("test")
+            .arg("--no-run")
+            .env("RUSTFLAGS", &self.rustflags)
+            .target_dir(&self.target_dir)
+            .package(&pkg.name)
+            .release();
+
+        if self.args.lib {
+            cmd = cmd.arg("--lib");
+        }
+
+        if self.args.tests || !self.args.lib {
+            cmd = cmd.tests()
+        }
+
+        if self.args.features.all_features {
+            cmd = cmd.all_features()
+        }
+
+        if self.args.features.no_default_features {
+            cmd = cmd.no_default_features();
+        }
+
+        if !&self.args.features.features.is_empty() {
+            cmd = cmd.features(&self.features)
+        }
+
+        if let Some(manifest) = self.args.manifest_path.as_deref() {
+            cmd = cmd.manifest_path(manifest);
+        }
+
+        cmd
+    }
+
+    fn configure_loom_command<'cmd>(&self, cmd: &'cmd mut Command) -> &'cmd mut Command {
+        cmd.env(ENV_MAX_BRANCHES, &self.max_branches);
+
+        if let Some(max_permutations) = self.max_permutations.as_deref() {
+            cmd.env(ENV_MAX_PERMUTATIONS, max_permutations);
+        }
+
+        cmd.env(ENV_MAX_THREADS, &self.max_threads);
+
+        if !self.test_args.is_empty() {
+            cmd.args(&self.test_args[..]);
+        }
+
+        cmd
     }
 }
 
