@@ -36,10 +36,10 @@ following actions:
 1. Building the test suite with `RUSTFLAGS="--cfg loom"` enabled
 2. Running the test suite (with support for [`cargo test`]-style filtering) to
    discover failing tests
-3. Rerunning failing tests to generate a checkpoint file for each failure case 
+3. Rerunning failing tests to generate a checkpoint file for each failure case
 4. Finally, re-running those failing tests a final time with logging and
    location tracking enabled, so that the failure can be debugged
-   
+
 Checkpoint files are stored according to the hash of the build artifact for the
 test suite, so when the code under test has not changed, the checkpointed
 execution may be reused in future runs to display different outputs or change
@@ -50,7 +50,7 @@ execution parameters.
 To install `cargo-loom`, run:
 
 ```console
-cargo install cargo-loom
+RUSTFLAGS="--cfg tokio_unstable" cargo install cargo-loom
 ```
 
 Once `cargo-loom` is installed, run
