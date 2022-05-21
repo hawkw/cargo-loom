@@ -3,7 +3,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use clap::Parser;
 use color_eyre::{
     eyre::{eyre, WrapErr},
-    Help,
+    Help, Result,
 };
 use escargot::{format::test, CargoTest, CommandMessages};
 use owo_colors::{colors, OwoColorize};
@@ -22,7 +22,7 @@ mod trace;
 #[derive(Debug)]
 pub struct App {
     args: Args,
-    pub checkpoint_dir: Utf8PathBuf,
+    pub(crate) checkpoint_dir: Utf8PathBuf,
     metadata: cargo_metadata::Metadata,
     target_dir: Utf8PathBuf,
     features: String,
@@ -38,9 +38,16 @@ pub struct App {
 
 #[derive(Default)]
 pub struct Failed {
-    failed: HashMap<String, Vec<FailedTest>>,
-    test_cmds: HashMap<String, CargoTest>,
+    failed: HashMap<Arc<str>, Vec<FailedTest>>,
+    test_cmds: HashMap<Arc<str>, CargoTest>,
     checkpoint_dirs: HashSet<Utf8PathBuf>,
+    curr_suite_name: Option<Arc<str>>,
+}
+
+#[derive(Debug)]
+pub struct TestOutput {
+    name: String,
+    output: Output,
 }
 
 #[derive(Debug)]
@@ -157,7 +164,7 @@ const ENV_CHECKPOINT_FILE: &str = "LOOM_CHECKPOINT_FILE";
 const ENV_LOOM_LOCATION: &str = "LOOM_LOCATION";
 
 impl Args {
-    fn metadata(&self) -> color_eyre::Result<cargo_metadata::Metadata> {
+    fn metadata(&self) -> Result<cargo_metadata::Metadata> {
         let mut cmd = cargo_metadata::MetadataCommand::new();
         if let Some(ref manifest_path) = self.manifest_path {
             cmd.manifest_path(manifest_path);
@@ -168,11 +175,11 @@ impl Args {
 }
 
 impl App {
-    pub fn parse() -> color_eyre::Result<Self> {
+    pub fn parse() -> Result<Self> {
         Self::from_args(Args::parse())
     }
 
-    fn from_args(mut args: Args) -> color_eyre::Result<Self> {
+    fn from_args(mut args: Args) -> Result<Self> {
         color_eyre::config::HookBuilder::default()
             .issue_url(concat!(env!("CARGO_PKG_REPOSITORY"), "/issues/new"))
             .add_issue_metadata("version", env!("CARGO_PKG_VERSION"))
@@ -264,7 +271,7 @@ impl App {
         })
     }
 
-    pub fn wanted_packages(&self) -> Vec<&cargo_metadata::Package> {
+    fn wanted_packages(&self) -> Vec<&cargo_metadata::Package> {
         self.args.workspace.partition_packages(&self.metadata).0
     }
 
@@ -320,7 +327,34 @@ impl App {
         cmd
     }
 
-    pub fn failing_tests(&self, pkg: &cargo_metadata::Package) -> color_eyre::Result<Failed> {
+    pub async fn run_all(&self) -> Result<()> {
+        for pkg in self.wanted_packages() {
+            self.run_package(pkg).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn run_package(&self, pkg: &cargo_metadata::Package) -> Result<()> {
+        let mut failing = self.failing_tests(pkg).with_context(|| {
+            format!("Error collecting failing tests for package `{}`", pkg.name)
+        })?;
+        let mut tasks = self
+            .run_failed(&mut failing)
+            .with_context(|| format!("Error rerunning failing tests for package `{}`", pkg.name))?;
+        while let Some(result) = tasks.join_one().await? {
+            let output = result?;
+            println!("\n --- test {} ---\n\n{}", output.name(), output.stdout()?);
+        }
+
+        for checkpoint_dir in failing.checkpoint_dirs() {
+            tracing::info!(checkpoint_dir = %checkpoint_dir, "Completed loom run");
+        }
+
+        Ok(())
+    }
+
+    fn failing_tests(&self, pkg: &cargo_metadata::Package) -> Result<Failed> {
         let json = self.args.trace_settings.message_format().is_json();
         let tests = self.test_cmd(pkg).run_tests()?;
         let mut failed = Failed::default();
@@ -393,7 +427,6 @@ impl App {
                                     if is_included {
                                         cmd.arg("--skip").arg(test);
                                         failed.fail_test(&suite, test.to_owned(), &checkpoint_dir);
-                                        any_failed = true;
                                         if !has_printed {
                                             eprintln!("\npreviously checkpointed");
                                             has_printed = true;
@@ -431,7 +464,6 @@ impl App {
                             test_status::<colors::Red>(&test_failed.name, "failed");
                         }
                         failed.fail_test(&suite, test_failed.name, &checkpoint_dir);
-                        any_failed = true;
                     }
                     Ok(Event::Test(Test::Ok(ok))) => {
                         if json {
@@ -502,20 +534,15 @@ impl App {
                 }
             }
 
-            if any_failed {
-                failed.test_cmds.insert(suite.name().to_string(), suite);
-            }
+            failed.finish_suite(suite);
         }
 
         Ok(failed)
     }
 
-    pub fn run_failed(
-        &self,
-        failed: Failed,
-    ) -> color_eyre::Result<JoinSet<color_eyre::Result<(String, Output)>>> {
+    fn run_failed(&self, failed: &mut Failed) -> Result<JoinSet<Result<TestOutput>>> {
         let mut tasks = JoinSet::new();
-        for (suite, tests) in failed.failed {
+        for (suite, tests) in failed.failed.drain() {
             let suite = failed
                 .test_cmds
                 .get(&suite)
@@ -553,7 +580,11 @@ impl App {
                         .output()
                         .await
                         .with_context(|| format!("spawn process to rerun {pretty_name}"))?;
-                    Ok((pretty_name, output))
+                    let output = TestOutput {
+                        name: pretty_name,
+                        output,
+                    };
+                    Ok(output)
                 };
                 tasks.spawn(task);
             }
@@ -576,8 +607,8 @@ impl fmt::Display for FailedTest {
 }
 
 impl Failed {
-    pub fn take_checkpoint_dirs(&mut self) -> HashSet<Utf8PathBuf> {
-        std::mem::take(&mut self.checkpoint_dirs)
+    pub fn checkpoint_dirs(&self) -> &HashSet<Utf8PathBuf> {
+        &self.checkpoint_dirs
     }
 
     fn fail_test(
@@ -590,10 +621,39 @@ impl Failed {
         if !self.checkpoint_dirs.contains(checkpoint_dir) {
             self.checkpoint_dirs.insert(checkpoint_dir.to_path_buf());
         }
+        let suite_name = self
+            .curr_suite_name
+            .get_or_insert_with(|| Arc::from(suite.name().to_owned()))
+            .clone();
+        debug_assert_eq!(suite_name.as_ref(), suite.name());
         self.failed
-            .entry(suite.name().to_owned())
+            .entry(suite_name)
             .or_default()
             .push(FailedTest::new(test_name, checkpoint_dir));
+    }
+
+    fn finish_suite(&mut self, suite: CargoTest) {
+        if let Some(suite_name) = self.curr_suite_name.take() {
+            self.test_cmds.insert(suite_name, suite);
+        }
+    }
+}
+
+// === impl TestOutput ===
+
+impl TestOutput {
+    pub fn name(&self) -> &str {
+        self.name.as_str()
+    }
+
+    pub fn stdout(&self) -> Result<&str> {
+        std::str::from_utf8(&self.output.stdout[..])
+            .with_context(|| format!("stdout from test `{}` was not utf8", self.name))
+    }
+
+    pub fn stderr(&self) -> Result<&str> {
+        std::str::from_utf8(&self.output.stderr[..])
+            .with_context(|| format!("stderr from test `{}` was not utf8", self.name))
     }
 }
 
