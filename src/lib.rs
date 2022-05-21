@@ -1,4 +1,11 @@
 #![doc = include_str!("../README.md")]
+
+#[cfg(not(tokio_unstable))]
+compile_error!(
+    "cargo-loom must be installed with: \
+    `RUSTFLAGS=\"--cfg tokio_unstable\" cargo install cargo-loom`"
+);
+
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::Parser;
 use color_eyre::{
