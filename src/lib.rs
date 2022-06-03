@@ -81,7 +81,7 @@ struct FailedTest {
 /// re-run only the failing iterations with diagnostics enabled. This makes
 /// running a large Loom suite much more efficient.
 #[derive(Parser, Debug)]
-#[clap(author, version, about)]
+#[clap(author, version, about, bin_name = "cargo")]
 struct Args {
     #[clap(flatten)]
     loom: LoomOptions,
