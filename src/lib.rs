@@ -83,6 +83,30 @@ struct FailedTest {
 #[derive(Parser, Debug)]
 #[clap(author, version, about)]
 struct Args {
+    #[clap(flatten)]
+    loom: LoomOptions,
+
+    #[clap(flatten)]
+    cargo: CargoOptions,
+
+    #[clap(flatten)]
+    trace_settings: trace::TraceSettings,
+
+    /// If specified, only run tests containing this string in their names
+    testname: Option<String>,
+
+    /// Arguments passed to the test binary.
+    #[clap(raw = true)]
+    test_args: Vec<String>,
+}
+
+/// Options that configure the underlying `cargo test` invocation.
+#[derive(Debug, clap::Args)]
+#[clap(
+    next_help_heading = "CARGO OPTIONS",
+    group = clap::ArgGroup::new("cargo-opts")
+)]
+struct CargoOptions {
     /// Path to Cargo.toml
     #[clap(long, env = "CARGO_MANIFEST_PATH", value_hint = clap::ValueHint::FilePath)]
     manifest_path: Option<std::path::PathBuf>,
@@ -93,6 +117,30 @@ struct Args {
     #[clap(flatten)]
     features: clap_cargo::Features,
 
+    /// Test only this package's library unit tests
+    #[clap(long)]
+    lib: bool,
+
+    /// Test all tests
+    #[clap(long)]
+    tests: bool,
+
+    /// Test all examples
+    #[clap(long)]
+    examples: bool,
+
+    /// Test all binaries
+    #[clap(long)]
+    bins: bool,
+}
+
+/// Options that configure Loom's behavior.
+#[derive(Debug, clap::Args)]
+#[clap(
+    next_help_heading = "LOOM OPTIONS",
+    group = clap::ArgGroup::new("loom-opts")
+)]
+struct LoomOptions {
     /// Maximum number of thread switches per permutation.
     ///
     /// This sets the value of the `LOOM_MAX_BRANCHES` environment variable for
@@ -137,32 +185,6 @@ struct Args {
     /// Log level filter for `loom` when re-running failed tests
     #[clap(long, env = ENV_LOOM_LOG, default_value = "trace")]
     loom_log: String,
-
-    /// Test only this package's library unit tests
-    #[clap(long)]
-    lib: bool,
-
-    /// Test all tests
-    #[clap(long)]
-    tests: bool,
-
-    /// Test all examples
-    #[clap(long)]
-    examples: bool,
-
-    /// Test all binaries
-    #[clap(long)]
-    bins: bool,
-
-    #[clap(flatten)]
-    trace_settings: trace::TraceSettings,
-
-    /// If specified, only run tests containing this string in their names
-    testname: Option<String>,
-
-    /// Arguments passed to the test binary.
-    #[clap(raw = true)]
-    test_args: Vec<String>,
 }
 
 const ENV_CHECKPOINT_INTERVAL: &str = "LOOM_CHECKPOINT_INTERVAL";
@@ -177,10 +199,10 @@ const ENV_LOOM_LOCATION: &str = "LOOM_LOCATION";
 impl Args {
     fn metadata(&self) -> Result<cargo_metadata::Metadata> {
         let mut cmd = cargo_metadata::MetadataCommand::new();
-        if let Some(ref manifest_path) = self.manifest_path {
+        if let Some(ref manifest_path) = self.cargo.manifest_path {
             cmd.manifest_path(manifest_path);
         }
-        self.features.forward_metadata(&mut cmd);
+        self.cargo.features.forward_metadata(&mut cmd);
         cmd.exec().context("getting cargo metadata")
     }
 }
@@ -509,7 +531,7 @@ impl App {
             .with_context(|| format!("creating checkpoint directory `{}`", checkpoint_dir))?;
 
         let mut features = String::new();
-        let mut feature_list = args.features.features.iter();
+        let mut feature_list = args.cargo.features.features.iter();
         if let Some(feature) = feature_list.next() {
             features.push_str(feature);
             for feature in feature_list {
@@ -526,12 +548,16 @@ impl App {
         // These all need to be represented as strings to pass them as env
         // variables. Format them a single time so we don't have to do it every
         // time we run a test.
-        let max_duration = args.max_duration_secs.as_ref().map(ToString::to_string);
-        let max_permutations = args.max_permutations.as_ref().map(ToString::to_string);
-        let max_branches = args.max_branches.to_string();
-        let max_threads = args.max_threads.to_string();
-        let checkpoint_interval = args.checkpoint_interval.to_string();
-        let loom_log = Arc::from(args.loom_log.clone());
+        let max_duration = args
+            .loom
+            .max_duration_secs
+            .as_ref()
+            .map(ToString::to_string);
+        let max_permutations = args.loom.max_permutations.as_ref().map(ToString::to_string);
+        let max_branches = args.loom.max_branches.to_string();
+        let max_threads = args.loom.max_threads.to_string();
+        let checkpoint_interval = args.loom.checkpoint_interval.to_string();
+        let loom_log = Arc::from(args.loom.loom_log.clone());
         let test_args = Arc::from(args.test_args.clone());
         Ok(Self {
             args,
@@ -551,7 +577,11 @@ impl App {
     }
 
     fn wanted_packages(&self) -> Vec<&cargo_metadata::Package> {
-        self.args.workspace.partition_packages(&self.metadata).0
+        self.args
+            .cargo
+            .workspace
+            .partition_packages(&self.metadata)
+            .0
     }
 
     fn test_cmd(&self, pkg: &cargo_metadata::Package) -> escargot::CargoBuild {
@@ -563,27 +593,27 @@ impl App {
             .package(&pkg.name)
             .release();
 
-        if self.args.lib {
+        if self.args.cargo.lib {
             cmd = cmd.arg("--lib");
         }
 
-        if self.args.tests || !self.args.lib {
+        if self.args.cargo.tests || !self.args.cargo.lib {
             cmd = cmd.tests()
         }
 
-        if self.args.features.all_features {
+        if self.args.cargo.features.all_features {
             cmd = cmd.all_features()
         }
 
-        if self.args.features.no_default_features {
+        if self.args.cargo.features.no_default_features {
             cmd = cmd.no_default_features();
         }
 
-        if !&self.args.features.features.is_empty() {
+        if !&self.args.cargo.features.features.is_empty() {
             cmd = cmd.features(&self.features)
         }
 
-        if let Some(manifest) = self.args.manifest_path.as_deref() {
+        if let Some(manifest) = self.args.cargo.manifest_path.as_deref() {
             cmd = cmd.manifest_path(manifest);
         }
 
