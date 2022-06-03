@@ -32,7 +32,7 @@ mod trace;
 /// display their output.
 #[derive(Debug)]
 pub struct App {
-    args: Args,
+    args: AppArgs,
     checkpoint_dir: Utf8PathBuf,
     metadata: cargo_metadata::Metadata,
     target_dir: Utf8PathBuf,
@@ -68,21 +68,34 @@ struct FailedTest {
     checkpoint: Utf8PathBuf,
 }
 
-/// A cargo subcommand for automating Loom testing workflows.
-///
-/// This utility will compile Loom tests, run them once to collect a list of
-/// those tests which fail, generate checkpoint files for all failing tests, and
-/// then finally rerun the failing tests from the generated checkpoint with
-/// logging and location capture enabled.
-///
-/// By initially running the suite without without logging, location
-/// capture, or checkpointing enabled, `cargo-loom` can quickly identify those
-/// tests that fail, run them until a failing iteration is found, and then
-/// re-run only the failing iterations with diagnostics enabled. This makes
-/// running a large Loom suite much more efficient.
 #[derive(Parser, Debug)]
 #[clap(author, version, about, bin_name = "cargo")]
-struct Args {
+struct CargoArgs {
+    #[clap(subcommand)]
+    cmd: Subcommand,
+}
+
+/// It's necessary to parse the app's args as a subcommand to make clap happy
+/// when we are run as a cargo subcommand..
+#[derive(Debug, clap::Subcommand)]
+enum Subcommand {
+    /// A cargo subcommand for automating Loom testing workflows.
+    ///
+    /// This utility will compile Loom tests, run them once to collect a list of
+    /// those tests which fail, generate checkpoint files for all failing tests, and
+    /// then finally rerun the failing tests from the generated checkpoint with
+    /// logging and location capture enabled.
+    ///
+    /// By initially running the suite without without logging, location
+    /// capture, or checkpointing enabled, `cargo-loom` can quickly identify those
+    /// tests that fail, run them until a failing iteration is found, and then
+    /// re-run only the failing iterations with diagnostics enabled. This makes
+    /// running a large Loom suite much more efficient.
+    Loom(AppArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct AppArgs {
     #[clap(flatten)]
     loom: LoomOptions,
 
@@ -196,7 +209,7 @@ const ENV_LOOM_LOG: &str = "LOOM_LOG";
 const ENV_CHECKPOINT_FILE: &str = "LOOM_CHECKPOINT_FILE";
 const ENV_LOOM_LOCATION: &str = "LOOM_LOCATION";
 
-impl Args {
+impl AppArgs {
     fn metadata(&self) -> Result<cargo_metadata::Metadata> {
         let mut cmd = cargo_metadata::MetadataCommand::new();
         if let Some(ref manifest_path) = self.cargo.manifest_path {
@@ -211,7 +224,10 @@ impl App {
     /// Parse an [`App`] configuration from command-line arguments and
     /// environment variables.
     pub fn parse() -> Result<Self> {
-        Self::from_args(Args::parse())
+        let CargoArgs {
+            cmd: Subcommand::Loom(args),
+        } = CargoArgs::parse();
+        Self::from_args(args)
     }
 
     /// Run all tests specified by this `App`'s command-line arguments and print
@@ -480,7 +496,7 @@ impl App {
         Ok(tasks)
     }
 
-    fn from_args(mut args: Args) -> Result<Self> {
+    fn from_args(mut args: AppArgs) -> Result<Self> {
         color_eyre::config::HookBuilder::default()
             .issue_url(concat!(env!("CARGO_PKG_REPOSITORY"), "/issues/new"))
             .add_issue_metadata("version", env!("CARGO_PKG_VERSION"))
