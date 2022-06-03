@@ -13,7 +13,11 @@ use tracing_subscriber::{
     registry::LookupSpan,
 };
 
-#[derive(Debug, clap::Parser)]
+#[derive(Debug, clap::Args)]
+#[clap(
+    next_help_heading = "OUTPUT OPTIONS",
+    group = clap::ArgGroup::new("trace-opts")
+)]
 pub struct TraceSettings {
     /// Controls when colored output is used.
     ///
