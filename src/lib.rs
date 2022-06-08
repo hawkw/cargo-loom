@@ -259,8 +259,8 @@ impl App {
         let mut tasks = self
             .run_failed(&mut failing)
             .with_context(|| format!("Error rerunning failing tests for package `{}`", pkg.name))?;
-        while let Some(result) = tasks.join_one().await? {
-            let output = result?;
+        while let Some(result) = tasks.join_one().await {
+            let output = result??;
             println!("\n --- test {} ---\n\n{}", output.name(), output.stdout()?);
         }
 
