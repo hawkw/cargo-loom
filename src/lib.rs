@@ -40,6 +40,7 @@ pub struct App {
     rustflags: String,
     max_branches: String,
     max_permutations: Option<String>,
+    max_preemptions: Option<String>,
     max_duration: Option<String>,
     max_threads: String,
     checkpoint_interval: String,
@@ -170,6 +171,16 @@ struct LoomOptions {
     #[clap(long, env = ENV_MAX_PERMUTATIONS)]
     max_permutations: Option<usize>,
 
+    /// Maximum number of thread preemptions to explore
+    ///
+    /// If no value is provided, the number of thread preemptions will not be
+    /// bounded.
+    ///
+    /// This sets the value of the `LOOM_MAX_PREEMPTIONS` environment variable
+    /// for the test executable.
+    #[clap(long, env = ENV_MAX_PREEMPTIONS)]
+    max_preemptions: Option<usize>,
+
     /// Max number of threads to check as part of the execution.
     ///
     /// This should be set as low as possible and must be less than 4.
@@ -204,6 +215,7 @@ const ENV_CHECKPOINT_INTERVAL: &str = "LOOM_CHECKPOINT_INTERVAL";
 const ENV_MAX_BRANCHES: &str = "LOOM_MAX_BRANCHES";
 const ENV_MAX_DURATION: &str = "LOOM_MAX_DURATION";
 const ENV_MAX_PERMUTATIONS: &str = "LOOM_MAX_PERMUTATIONS";
+const ENV_MAX_PREEMPTIONS: &str = "LOOM_MAX_PREEMPTIONS";
 const ENV_MAX_THREADS: &str = "LOOM_MAX_THREADS";
 const ENV_LOOM_LOG: &str = "LOOM_LOG";
 const ENV_CHECKPOINT_FILE: &str = "LOOM_CHECKPOINT_FILE";
@@ -570,6 +582,7 @@ impl App {
             .as_ref()
             .map(ToString::to_string);
         let max_permutations = args.loom.max_permutations.as_ref().map(ToString::to_string);
+        let max_preemptions = args.loom.max_preemptions.as_ref().map(ToString::to_string);
         let max_branches = args.loom.max_branches.to_string();
         let max_threads = args.loom.max_threads.to_string();
         let checkpoint_interval = args.loom.checkpoint_interval.to_string();
@@ -585,6 +598,7 @@ impl App {
             max_branches,
             max_duration,
             max_permutations,
+            max_preemptions,
             max_threads,
             checkpoint_interval,
             loom_log,
@@ -641,6 +655,10 @@ impl App {
 
         if let Some(max_permutations) = self.max_permutations.as_deref() {
             cmd.env(ENV_MAX_PERMUTATIONS, max_permutations);
+        }
+
+        if let Some(max_preemptions) = self.max_preemptions.as_deref() {
+            cmd.env(ENV_MAX_PREEMPTIONS, max_preemptions);
         }
 
         cmd.env(ENV_MAX_THREADS, &self.max_threads);
